@@ -1,0 +1,43 @@
+# ---- Secrets (NEVER commit) ----
+.env
+*.env
+!.env.example
+HF_TOKEN
+*.token
+rclone.conf
+*.credentials.json
+client_secret*.json
+
+# ---- Dataset (streamed from Google Drive / bind-mounted, never in git) ----
+data/
+Padchest_GR_files/
+PadChest_GR_progression_prior_studies/
+grounded_reports_*.json
+master_table.csv
+master_table.csv.zip
+*.dcm
+
+# ---- Model weights / caches ----
+*.safetensors
+*.bin
+*.pt
+*.pth
+huggingface/
+.cache/
+
+# ---- Outputs ----
+outputs/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+cure_env/
+
+# ---- OS / editor ----
+.DS_Store
+.idea/
+.vscode/

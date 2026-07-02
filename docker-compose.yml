@@ -1,0 +1,42 @@
+# Docker Compose for the CXR model comparison on a CUDA GPU host (e.g. Vast.ai).
+#
+# Usage:
+#   1. cp .env.example .env   and fill in HF_TOKEN + DATA_DIR_HOST
+#   2. docker compose build
+#   3. docker compose run --rm compare
+#
+# The dataset is NEVER baked into the image. It is bind-mounted read-only from
+# DATA_DIR_HOST (a local copy OR an rclone Google Drive mount) into /data.
+
+services:
+  compare:
+    build: .
+    image: rx-cxr-compare:latest
+    env_file:
+      - .env
+    environment:
+      DEVICE: ${DEVICE:-cuda}
+      USE_4BIT: ${USE_4BIT:-1}
+      N_IMAGES: ${N_IMAGES:-1}
+      MODELS: ${MODELS:-cure,maira2,medgemma15}
+      DATA_DIR: /data
+      OUTPUT_DIR: /app/outputs
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      # Dataset (read-only). Point DATA_DIR_HOST at your local copy or rclone mount.
+      - ${DATA_DIR_HOST:-./data}:/data:ro
+      # Results land here on the host.
+      - ./outputs:/app/outputs
+      # Persist the Hugging Face model cache between runs (avoids re-downloading).
+      - hf-cache:/root/.cache/huggingface
+    # GPU access (Docker Compose v2 + NVIDIA Container Toolkit).
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  hf-cache:

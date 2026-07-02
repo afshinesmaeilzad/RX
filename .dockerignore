@@ -1,0 +1,13 @@
+# Keep the build context tiny and free of secrets/data.
+.git
+.gitignore
+README.md
+.env
+*.token
+HF_TOKEN
+rclone.conf
+data/
+outputs/
+__pycache__/
+*.pyc
+.DS_Store

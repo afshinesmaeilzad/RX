@@ -1,0 +1,22 @@
+# Python dependencies for the CXR model comparison (CURE / MAIRA-2 / MedGemma 1.5).
+#
+# NOTE: torch is intentionally NOT listed here. The Docker base image
+# (pytorch/pytorch:*-cuda*-cudnn*-runtime) already ships a CUDA-enabled torch.
+# Installing torch again from PyPI could pull a CPU-only build and break CUDA.
+#
+# transformers is pinned to 4.51.3: the only line that satisfies BOTH
+#   - MAIRA-2 (needs >=4.48,<4.52, tested on 4.51.3), and
+#   - Gemma 3 based models CURE + MedGemma 1.5 (need >=4.50).
+
+transformers==4.51.3
+accelerate>=0.34.0
+peft>=0.13.0
+bitsandbytes>=0.43.0
+huggingface_hub>=0.25.0
+safetensors>=0.4.0
+sentencepiece>=0.1.99
+protobuf>=3.20
+pillow>=10.0
+opencv-python-headless>=4.8
+matplotlib>=3.7
+numpy>=1.24,<2
