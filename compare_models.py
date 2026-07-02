@@ -48,10 +48,15 @@ import csv
 import gc
 import json
 import os
+import platform
 import random
 import re
+import statistics
+import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 import cv2
@@ -386,12 +391,18 @@ def evaluate_grounded_report(
                 "labels": f.get("labels", []) or [],
                 "box_xyxy": box,
                 "matched": False,
+                "best_iou": 0.0,
             })
 
     rows = []
     for p in pred_findings:
         if not p.get("boxes"):
-            rows.append({"pred": p.get("sentence", ""), "iou": None, "matched_gt": None})
+            rows.append({
+                "pred": p.get("sentence", ""),
+                "iou": None,
+                "matched_gt": None,
+                "matched_gt_labels": [],
+            })
             continue
 
         box = p["boxes"][0]
@@ -407,13 +418,20 @@ def evaluate_grounded_report(
 
         if best[1] is not None and best[0] > 0:
             gt_findings[best[1]]["matched"] = True
+            gt_findings[best[1]]["best_iou"] = best[0]
             rows.append({
                 "pred": p.get("sentence", ""),
                 "iou": best[0],
                 "matched_gt": gt_findings[best[1]]["sentence"],
+                "matched_gt_labels": gt_findings[best[1]]["labels"],
             })
         else:
-            rows.append({"pred": p.get("sentence", ""), "iou": 0.0, "matched_gt": None})
+            rows.append({
+                "pred": p.get("sentence", ""),
+                "iou": 0.0,
+                "matched_gt": None,
+                "matched_gt_labels": [],
+            })
 
     valid_ious = [r["iou"] for r in rows if r["iou"] is not None]
     mean_iou = sum(valid_ious) / len(valid_ious) if valid_ious else 0.0
@@ -445,6 +463,14 @@ def evaluate_grounded_report(
         "n_predicted_with_box": sum(1 for p in pred_findings if p.get("boxes")),
         "n_gt_boxes": n_gt,
         "missed_gt": [g["sentence"] for g in gt_findings if not g["matched"]],
+        "gt_detail": [
+            {
+                "sentence": g["sentence"],
+                "labels": g["labels"],
+                "best_iou": g["best_iou"],
+            }
+            for g in gt_findings
+        ],
         **recalls,
     }
 
@@ -871,6 +897,540 @@ def serialize_result(result: ModelRunResult) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Thesis-grade metrics
+# ---------------------------------------------------------------------------
+
+THESIS_THRESHOLDS = (0.3, 0.5)
+
+
+def _safe_div(num: float, den: float) -> float:
+    return num / den if den else 0.0
+
+
+def _f1(precision: float, recall: float) -> float:
+    return _safe_div(2 * precision * recall, precision + recall)
+
+
+def compute_thesis_metrics(
+    results_by_model: dict[str, list[ModelRunResult]],
+    thresholds: tuple[float, ...] = THESIS_THRESHOLDS,
+) -> dict[str, Any]:
+    """
+    Compute per-model detection metrics for the thesis report:
+
+      - Precision / Recall / F1 at each IoU threshold, both micro (pooled boxes)
+        and macro (mean of per-image scores, with std dev).
+      - Mean IoU of matched pairs (micro + macro + std).
+      - Hallucination rate (fraction of predicted boxes with no GT match) at 0.5.
+      - Per-pathology (label) recall@0.5 and mean best IoU.
+
+    Definitions per image at threshold t:
+      TP = predicted boxes matched to a GT box with IoU >= t
+      FP = predicted boxes with no qualifying GT match (hallucinations)
+      FN = GT boxes left unmatched
+    """
+    out: dict[str, Any] = {}
+
+    for model_key, runs in results_by_model.items():
+        valid = [r for r in runs if r.eval_summary is not None and r.error is None]
+
+        model_metrics: dict[str, Any] = {
+            "n_images": len(valid),
+            "n_errors": sum(1 for r in runs if r.error),
+            "thresholds": {},
+        }
+
+        # Matched-pair IoU (independent of threshold).
+        per_image_match_iou: list[float] = []
+        all_pair_ious: list[float] = []
+        for r in valid:
+            pair_ious = [
+                row["iou"]
+                for row in r.eval_summary["rows"]
+                if row.get("matched_gt") is not None and row.get("iou") is not None
+            ]
+            all_pair_ious.extend(pair_ious)
+            per_image_match_iou.append(sum(pair_ious) / len(pair_ious) if pair_ious else 0.0)
+
+        model_metrics["mean_iou_micro"] = (
+            sum(all_pair_ious) / len(all_pair_ious) if all_pair_ious else 0.0
+        )
+        model_metrics["mean_iou_macro"] = (
+            statistics.mean(per_image_match_iou) if per_image_match_iou else 0.0
+        )
+        model_metrics["mean_iou_std"] = (
+            statistics.pstdev(per_image_match_iou) if len(per_image_match_iou) > 1 else 0.0
+        )
+        model_metrics["avg_latency_s"] = (
+            statistics.mean([r.latency_s for r in valid]) if valid else 0.0
+        )
+        model_metrics["total_pred_boxes"] = sum(
+            r.eval_summary["n_predicted_with_box"] for r in valid
+        )
+        model_metrics["total_gt_boxes"] = sum(r.eval_summary["n_gt_boxes"] for r in valid)
+
+        for t in thresholds:
+            tp = fp = fn = 0
+            per_img_p: list[float] = []
+            per_img_r: list[float] = []
+            per_img_f1: list[float] = []
+
+            for r in valid:
+                ev = r.eval_summary
+                preds_with_box = ev["n_predicted_with_box"]
+                n_gt = ev["n_gt_boxes"]
+                img_tp = sum(
+                    1
+                    for row in ev["rows"]
+                    if row.get("iou") is not None and row["iou"] >= t
+                )
+                img_fp = preds_with_box - img_tp
+                img_fn = n_gt - img_tp
+
+                tp += img_tp
+                fp += img_fp
+                fn += img_fn
+
+                p_i = _safe_div(img_tp, img_tp + img_fp)
+                r_i = _safe_div(img_tp, img_tp + img_fn)
+                per_img_p.append(p_i)
+                per_img_r.append(r_i)
+                per_img_f1.append(_f1(p_i, r_i))
+
+            precision_micro = _safe_div(tp, tp + fp)
+            recall_micro = _safe_div(tp, tp + fn)
+
+            model_metrics["thresholds"][str(t)] = {
+                "tp": tp,
+                "fp": fp,
+                "fn": fn,
+                "precision_micro": precision_micro,
+                "recall_micro": recall_micro,
+                "f1_micro": _f1(precision_micro, recall_micro),
+                "precision_macro": statistics.mean(per_img_p) if per_img_p else 0.0,
+                "recall_macro": statistics.mean(per_img_r) if per_img_r else 0.0,
+                "f1_macro": statistics.mean(per_img_f1) if per_img_f1 else 0.0,
+                "recall_macro_std": statistics.pstdev(per_img_r) if len(per_img_r) > 1 else 0.0,
+                "hallucination_rate": 1.0 - precision_micro,
+            }
+
+        # Per-pathology (label) breakdown, pooled across images.
+        label_stats: dict[str, dict[str, Any]] = {}
+        for r in valid:
+            for g in r.eval_summary.get("gt_detail", []):
+                for label in g.get("labels", []) or []:
+                    ls = label_stats.setdefault(
+                        label, {"n_gt": 0, "matched_05": 0, "iou_sum": 0.0}
+                    )
+                    ls["n_gt"] += 1
+                    ls["iou_sum"] += g.get("best_iou", 0.0)
+                    if g.get("best_iou", 0.0) >= 0.5:
+                        ls["matched_05"] += 1
+
+        per_label = []
+        for label, ls in sorted(label_stats.items(), key=lambda kv: -kv[1]["n_gt"]):
+            per_label.append({
+                "label": label,
+                "n_gt": ls["n_gt"],
+                "recall@0.5": _safe_div(ls["matched_05"], ls["n_gt"]),
+                "mean_best_iou": _safe_div(ls["iou_sum"], ls["n_gt"]),
+            })
+        model_metrics["per_label"] = per_label
+
+        out[model_key] = model_metrics
+
+    return out
+
+
+def collect_run_metadata(cfg: DeviceConfig) -> dict[str, Any]:
+    import transformers
+
+    try:
+        import peft
+
+        peft_version = peft.__version__
+    except Exception:
+        peft_version = "n/a"
+
+    meta: dict[str, Any] = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "device": str(cfg.device),
+        "dtype": str(cfg.dtype),
+        "use_4bit": cfg.use_4bit,
+        "n_images": N_IMAGES,
+        "shuffle_seed": SHUFFLE_SEED,
+        "models": MODELS,
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "torch": torch.__version__,
+        "transformers": transformers.__version__,
+        "peft": peft_version,
+    }
+
+    if cfg.device.type == "cuda" and torch.cuda.is_available():
+        try:
+            meta["gpu_name"] = torch.cuda.get_device_name(0)
+            meta["gpu_vram_gb"] = round(
+                torch.cuda.get_device_properties(0).total_memory / 1e9, 1
+            )
+        except Exception:
+            pass
+
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=BASE_DIR,
+            stderr=subprocess.DEVNULL,
+        )
+        meta["git_commit"] = commit.decode().strip()
+    except Exception:
+        meta["git_commit"] = "n/a"
+
+    return meta
+
+
+# ---------------------------------------------------------------------------
+# Plots
+# ---------------------------------------------------------------------------
+
+
+def _bar_plot(
+    model_keys: list[str],
+    series: dict[str, list[float]],
+    title: str,
+    ylabel: str,
+    out_path: str,
+    errors: dict[str, list[float]] | None = None,
+) -> None:
+    x = np.arange(len(model_keys))
+    n_series = len(series)
+    width = 0.8 / max(n_series, 1)
+
+    fig, ax = plt.subplots(figsize=(max(6, 1.8 * len(model_keys) * n_series), 4.5))
+    for i, (name, vals) in enumerate(series.items()):
+        offset = (i - (n_series - 1) / 2) * width
+        err = errors.get(name) if errors else None
+        bars = ax.bar(x + offset, vals, width, label=name, yerr=err, capsize=4)
+        ax.bar_label(bars, fmt="%.2f", fontsize=8, padding=2)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([k.upper() for k in model_keys])
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    if n_series > 1:
+        ax.legend()
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+
+
+def generate_plots(
+    thesis_metrics: dict[str, Any],
+    plots_dir: str,
+) -> list[str]:
+    os.makedirs(plots_dir, exist_ok=True)
+    model_keys = [k for k in MODELS if k in thesis_metrics and thesis_metrics[k]["n_images"] > 0]
+    if not model_keys:
+        return []
+
+    paths: list[str] = []
+
+    # 1. Mean IoU (macro) with std error bars.
+    iou_path = os.path.join(plots_dir, "mean_iou.png")
+    _bar_plot(
+        model_keys,
+        {"mean IoU (macro)": [thesis_metrics[k]["mean_iou_macro"] for k in model_keys]},
+        "Mean IoU of matched boxes (macro avg +/- std)",
+        "IoU",
+        iou_path,
+        errors={"mean IoU (macro)": [thesis_metrics[k]["mean_iou_std"] for k in model_keys]},
+    )
+    paths.append(iou_path)
+
+    # 2. Precision / Recall / F1 at IoU 0.5 (micro).
+    prf_path = os.path.join(plots_dir, "precision_recall_f1_at_0.5.png")
+    _bar_plot(
+        model_keys,
+        {
+            "precision": [thesis_metrics[k]["thresholds"]["0.5"]["precision_micro"] for k in model_keys],
+            "recall": [thesis_metrics[k]["thresholds"]["0.5"]["recall_micro"] for k in model_keys],
+            "F1": [thesis_metrics[k]["thresholds"]["0.5"]["f1_micro"] for k in model_keys],
+        },
+        "Detection performance @ IoU>=0.5 (micro)",
+        "score",
+        prf_path,
+    )
+    paths.append(prf_path)
+
+    # 3. Recall at 0.3 vs 0.5 (micro).
+    rec_path = os.path.join(plots_dir, "recall_at_thresholds.png")
+    _bar_plot(
+        model_keys,
+        {
+            "recall@0.3": [thesis_metrics[k]["thresholds"]["0.3"]["recall_micro"] for k in model_keys],
+            "recall@0.5": [thesis_metrics[k]["thresholds"]["0.5"]["recall_micro"] for k in model_keys],
+        },
+        "Recall at IoU thresholds (micro)",
+        "recall",
+        rec_path,
+    )
+    paths.append(rec_path)
+
+    # 4. Hallucination rate @ 0.5.
+    hall_path = os.path.join(plots_dir, "hallucination_rate.png")
+    _bar_plot(
+        model_keys,
+        {"hallucination rate": [thesis_metrics[k]["thresholds"]["0.5"]["hallucination_rate"] for k in model_keys]},
+        "Hallucination rate (1 - precision @ IoU>=0.5)",
+        "rate",
+        hall_path,
+    )
+    paths.append(hall_path)
+
+    # 5. Average latency per image.
+    lat_path = os.path.join(plots_dir, "latency.png")
+    _bar_plot(
+        model_keys,
+        {"sec/image": [thesis_metrics[k]["avg_latency_s"] for k in model_keys]},
+        "Average inference latency per image",
+        "seconds",
+        lat_path,
+    )
+    paths.append(lat_path)
+
+    return paths
+
+
+# ---------------------------------------------------------------------------
+# Markdown report
+# ---------------------------------------------------------------------------
+
+
+def _fmt(x: float, nd: int = 3) -> str:
+    return f"{x:.{nd}f}"
+
+
+def write_markdown_report(
+    report_path: str,
+    metadata: dict[str, Any],
+    thesis_metrics: dict[str, Any],
+    samples: list[ImageSample],
+    all_results: dict[str, dict[str, ModelRunResult]],
+    plot_paths: list[str],
+    output_dir: str,
+) -> None:
+    model_keys = [k for k in MODELS if k in thesis_metrics]
+    lines: list[str] = []
+
+    def rel(path: str) -> str:
+        return os.path.relpath(path, output_dir)
+
+    lines.append("# CXR Grounded Report Model Comparison")
+    lines.append("")
+    lines.append(
+        "Comparison of **CURE**, **MAIRA-2**, and **MedGemma 1.5** on PadChest-GR "
+        "grounded report generation. Predicted bounding boxes are matched to "
+        "ground-truth boxes by IoU (greedy, one-to-one)."
+    )
+    lines.append("")
+
+    # Environment / reproducibility.
+    lines.append("## 1. Run metadata (reproducibility)")
+    lines.append("")
+    lines.append("| Field | Value |")
+    lines.append("|---|---|")
+    for key in [
+        "timestamp_utc", "git_commit", "device", "gpu_name", "gpu_vram_gb",
+        "dtype", "use_4bit", "n_images", "shuffle_seed", "models",
+        "python", "platform", "torch", "transformers", "peft",
+    ]:
+        if key in metadata:
+            val = metadata[key]
+            if isinstance(val, list):
+                val = ", ".join(val)
+            lines.append(f"| `{key}` | {val} |")
+    lines.append("")
+
+    # Main results table.
+    lines.append("## 2. Headline detection metrics")
+    lines.append("")
+    lines.append(
+        "Micro = pooled over all boxes; Macro = mean over per-image scores. "
+        "Mean IoU is over matched pairs only."
+    )
+    lines.append("")
+    header = (
+        "| Model | N | mean IoU (macro±std) | P@0.5 | R@0.5 | F1@0.5 | "
+        "R@0.3 | Halluc.@0.5 | sec/img | errors |"
+    )
+    lines.append(header)
+    lines.append("|" + "---|" * 10)
+    for k in model_keys:
+        m = thesis_metrics[k]
+        t5 = m["thresholds"].get("0.5", {})
+        t3 = m["thresholds"].get("0.3", {})
+        lines.append(
+            f"| **{k.upper()}** | {m['n_images']} | "
+            f"{_fmt(m['mean_iou_macro'])} ± {_fmt(m['mean_iou_std'])} | "
+            f"{_fmt(t5.get('precision_micro', 0))} | {_fmt(t5.get('recall_micro', 0))} | "
+            f"{_fmt(t5.get('f1_micro', 0))} | {_fmt(t3.get('recall_micro', 0))} | "
+            f"{_fmt(t5.get('hallucination_rate', 0))} | {_fmt(m['avg_latency_s'], 1)} | "
+            f"{m['n_errors']} |"
+        )
+    lines.append("")
+    lines.append(
+        "Box totals: "
+        + "; ".join(
+            f"{k.upper()} pred={thesis_metrics[k]['total_pred_boxes']}, "
+            f"gt={thesis_metrics[k]['total_gt_boxes']}"
+            for k in model_keys
+        )
+    )
+    lines.append("")
+
+    # Micro/macro detail per threshold.
+    lines.append("## 3. Precision / Recall / F1 (micro and macro)")
+    lines.append("")
+    for t in THESIS_THRESHOLDS:
+        lines.append(f"### IoU threshold {t}")
+        lines.append("")
+        lines.append(
+            "| Model | P micro | R micro | F1 micro | P macro | R macro | F1 macro | TP | FP | FN |"
+        )
+        lines.append("|" + "---|" * 10)
+        for k in model_keys:
+            td = thesis_metrics[k]["thresholds"].get(str(t), {})
+            lines.append(
+                f"| {k.upper()} | {_fmt(td.get('precision_micro', 0))} | "
+                f"{_fmt(td.get('recall_micro', 0))} | {_fmt(td.get('f1_micro', 0))} | "
+                f"{_fmt(td.get('precision_macro', 0))} | {_fmt(td.get('recall_macro', 0))} | "
+                f"{_fmt(td.get('f1_macro', 0))} | {td.get('tp', 0)} | {td.get('fp', 0)} | "
+                f"{td.get('fn', 0)} |"
+            )
+        lines.append("")
+
+    # Plots.
+    if plot_paths:
+        lines.append("## 4. Plots")
+        lines.append("")
+        for p in plot_paths:
+            name = os.path.splitext(os.path.basename(p))[0].replace("_", " ")
+            lines.append(f"### {name}")
+            lines.append("")
+            lines.append(f"![{name}]({rel(p)})")
+            lines.append("")
+
+    # Per-pathology breakdown.
+    lines.append("## 5. Per-pathology breakdown (recall@0.5 / mean best IoU)")
+    lines.append("")
+    for k in model_keys:
+        per_label = thesis_metrics[k].get("per_label", [])
+        if not per_label:
+            continue
+        lines.append(f"### {k.upper()}")
+        lines.append("")
+        lines.append("| Pathology | GT boxes | recall@0.5 | mean best IoU |")
+        lines.append("|---|---|---|---|")
+        for row in per_label:
+            lines.append(
+                f"| {row['label']} | {row['n_gt']} | "
+                f"{_fmt(row['recall@0.5'])} | {_fmt(row['mean_best_iou'])} |"
+            )
+        lines.append("")
+
+    # Per-image appendix.
+    lines.append("## 6. Per-image appendix")
+    lines.append("")
+    for sample in samples:
+        lines.append(f"### {sample.image_id}")
+        lines.append("")
+        fig_path = os.path.join(
+            output_dir, "per_image", f"compare_{os.path.splitext(sample.image_id)[0]}.png"
+        )
+        if os.path.exists(fig_path):
+            lines.append(f"![{sample.image_id}]({rel(fig_path)})")
+            lines.append("")
+        lines.append("**Ground-truth findings:**")
+        lines.append("")
+        for s in sample.gt_sentences:
+            lines.append(f"- {s}")
+        lines.append("")
+        for k in model_keys:
+            result = all_results.get(sample.image_id, {}).get(k)
+            if result is None:
+                continue
+            lines.append(f"**{k.upper()}**", )
+            if result.error:
+                lines.append("")
+                lines.append(f"> ERROR: {result.error}")
+                lines.append("")
+                continue
+            ev = result.eval_summary or {}
+            lines.append(
+                f" — mean IoU {_fmt(ev.get('mean_iou', 0))}, "
+                f"R@0.3 {_fmt(ev.get('recall@0.3', 0), 2)}, "
+                f"R@0.5 {_fmt(ev.get('recall@0.5', 0), 2)}, "
+                f"{_fmt(result.latency_s, 1)}s"
+            )
+            lines.append("")
+            lines.append("```")
+            lines.append(result.report_text.strip() or "(empty output)")
+            lines.append("```")
+            lines.append("")
+
+    # Caveats.
+    lines.append("## 7. Caveats")
+    lines.append("")
+    lines.append(
+        "- CURE boxes are normalized to its 448x448 CLAHE input, while MAIRA-2 and "
+        "MedGemma 1.5 use original-image coordinates, so cross-model IoU is an "
+        "approximate comparison rather than an exact benchmark."
+    )
+    lines.append(
+        "- MedGemma 1.5's grounded-box output format is not standardized; box "
+        "parsing is best-effort and may undercount its predictions."
+    )
+    lines.append(
+        "- Matching is greedy one-to-one by IoU; a predicted box can match at most "
+        "one GT box."
+    )
+    lines.append("")
+
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# Logging (tee stdout+stderr to run.log)
+# ---------------------------------------------------------------------------
+
+
+class _Tee:
+    def __init__(self, log_path: str):
+        self._log = open(log_path, "w", encoding="utf-8")
+        self._stdout = sys.stdout
+        self._stderr = sys.stderr
+
+    def write(self, data: str) -> int:
+        self._stdout.write(data)
+        self._log.write(data)
+        self._log.flush()
+        return len(data)
+
+    def flush(self) -> None:
+        self._stdout.flush()
+        self._log.flush()
+
+    def close(self) -> None:
+        try:
+            self._log.close()
+        finally:
+            sys.stdout = self._stdout
+            sys.stderr = self._stderr
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -879,6 +1439,12 @@ def main() -> None:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     per_image_dir = os.path.join(OUTPUT_DIR, "per_image")
     os.makedirs(per_image_dir, exist_ok=True)
+
+    tee = _Tee(os.path.join(OUTPUT_DIR, "run.log"))
+    sys.stdout = tee
+    sys.stderr = tee
+
+    print(f"Run started (UTC): {datetime.now(timezone.utc).isoformat(timespec='seconds')}")
 
     setup_hf_auth()
     cfg = resolve_device_config()
@@ -969,6 +1535,9 @@ def main() -> None:
     summary_rows = aggregate_model_metrics(results_by_model)
     print_summary_table(summary_rows)
 
+    thesis_metrics = compute_thesis_metrics(results_by_model)
+    metadata = collect_run_metadata(cfg)
+
     json_payload = {
         "config": {
             "n_images": N_IMAGES,
@@ -977,6 +1546,8 @@ def main() -> None:
             "device": str(cfg.device),
             "use_4bit": cfg.use_4bit,
         },
+        "metadata": metadata,
+        "thesis_metrics": thesis_metrics,
         "images": [],
         "summary": summary_rows,
     }
@@ -1008,22 +1579,60 @@ def main() -> None:
     print(f"Saved JSON: {json_path}")
 
     csv_path = os.path.join(OUTPUT_DIR, "comparison_summary.csv")
+    csv_fields = [
+        "model", "n_images",
+        "mean_iou_micro", "mean_iou_macro", "mean_iou_std",
+        "precision@0.5_micro", "recall@0.5_micro", "f1@0.5_micro",
+        "recall@0.3_micro", "hallucination@0.5",
+        "avg_latency_s", "total_pred_boxes", "total_gt_boxes", "errors",
+    ]
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                "model",
-                "n_images",
-                "mean_iou_macro",
-                "recall@0.3_macro",
-                "recall@0.5_macro",
-                "avg_latency_s",
-                "errors",
-            ],
-        )
+        writer = csv.DictWriter(f, fieldnames=csv_fields)
         writer.writeheader()
-        writer.writerows(summary_rows)
+        for k in MODELS:
+            if k not in thesis_metrics:
+                continue
+            m = thesis_metrics[k]
+            t5 = m["thresholds"].get("0.5", {})
+            t3 = m["thresholds"].get("0.3", {})
+            writer.writerow({
+                "model": k,
+                "n_images": m["n_images"],
+                "mean_iou_micro": round(m["mean_iou_micro"], 4),
+                "mean_iou_macro": round(m["mean_iou_macro"], 4),
+                "mean_iou_std": round(m["mean_iou_std"], 4),
+                "precision@0.5_micro": round(t5.get("precision_micro", 0.0), 4),
+                "recall@0.5_micro": round(t5.get("recall_micro", 0.0), 4),
+                "f1@0.5_micro": round(t5.get("f1_micro", 0.0), 4),
+                "recall@0.3_micro": round(t3.get("recall_micro", 0.0), 4),
+                "hallucination@0.5": round(t5.get("hallucination_rate", 0.0), 4),
+                "avg_latency_s": round(m["avg_latency_s"], 2),
+                "total_pred_boxes": m["total_pred_boxes"],
+                "total_gt_boxes": m["total_gt_boxes"],
+                "errors": m["n_errors"],
+            })
     print(f"Saved CSV: {csv_path}")
+
+    plots_dir = os.path.join(OUTPUT_DIR, "plots")
+    plot_paths = generate_plots(thesis_metrics, plots_dir)
+    for p in plot_paths:
+        print(f"Saved plot: {p}")
+
+    report_path = os.path.join(OUTPUT_DIR, "report.md")
+    write_markdown_report(
+        report_path=report_path,
+        metadata=metadata,
+        thesis_metrics=thesis_metrics,
+        samples=samples,
+        all_results=all_results,
+        plot_paths=plot_paths,
+        output_dir=OUTPUT_DIR,
+    )
+    print(f"Saved report: {report_path}")
+
+    print(f"\nRun finished (UTC): {datetime.now(timezone.utc).isoformat(timespec='seconds')}")
+    print(f"All outputs in: {OUTPUT_DIR}")
+    tee.close()
 
 
 if __name__ == "__main__":

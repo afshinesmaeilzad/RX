@@ -19,9 +19,26 @@ enough VRAM for the largest single model, not all three at once.
 
 Running the container produces, in `outputs/compare/`:
 
+- `report.md` — **the complete, thesis-ready report**: reproducibility metadata,
+  headline metrics, precision/recall/F1 (micro + macro), per-pathology breakdown,
+  embedded plots, and a per-image appendix with each model's text + scores
+- `plots/` — bar charts: mean IoU (±std), precision/recall/F1@0.5, recall@0.3 vs
+  0.5, hallucination rate, latency
+- `comparison_results.json` — full raw log: reports, boxes, per-finding IoU,
+  per-image scores, `thesis_metrics`, and run metadata
+- `comparison_summary.csv` — per-model headline table (mean IoU micro/macro/std,
+  P/R/F1@0.5, recall@0.3, hallucination rate, latency, box counts)
 - `per_image/compare_<id>.png` — side-by-side panels (green = ground truth, colored = each model's boxes)
-- `comparison_results.json` — full reports, boxes, and per-image scores
-- `comparison_summary.csv` — per-model macro mean IoU, recall, latency
+- `run.log` — full stdout/stderr transcript of the run (timing, warnings, errors)
+
+### Metrics reported (per model)
+
+- **Detection:** precision, recall, F1 at IoU >= 0.3 and >= 0.5, both micro
+  (pooled over all boxes) and macro (mean of per-image scores, with std dev)
+- **Localization:** mean IoU of matched boxes (micro + macro + std)
+- **Hallucination rate:** fraction of predicted boxes with no ground-truth match
+- **Per-pathology:** recall@0.5 and mean best IoU for each PadChest-GR label
+- **Efficiency:** average inference latency per image
 
 ---
 
