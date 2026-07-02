@@ -68,7 +68,51 @@ Never paste tokens into tracked files. `.gitignore` blocks `.env`, `HF_TOKEN`,
 
 ---
 
-## Step-by-step: run on a Vast.ai GPU
+## Recommended: run on Vast.ai (PyTorch template, no Docker)
+
+A Vast.ai instance is **already a container**, so running the script directly on
+the **PyTorch** template is simpler and more reliable than Docker-in-Docker.
+This is the recommended path for Vast.
+
+### 1. Rent an instance
+- Template: **PyTorch (Vast)** — or **PyTorch NGC** (both have CUDA + PyTorch + SSH)
+- GPU: **1× RTX 4090 (24 GB)**
+- Disk: **~80 GB**
+
+### 2. Clone, configure token, get the data
+```bash
+git clone https://github.com/afshinesmaeilzad/RX.git
+cd RX
+
+export HF_TOKEN=hf_xxx        # accept the 3 model licenses on HF first
+
+# Dataset: either mount Google Drive read-only...
+GDRIVE_SUBPATH="PadChest/extracted/BIMCV-Padchest-GR" ./scripts/setup_gdrive.sh
+# ...or point DATA_DIR at a local copy you downloaded.
+```
+
+### 3. Run it (one command)
+```bash
+# Dry run first (2 images, verifies all 3 models):
+DATA_DIR=/data N_IMAGES=2 ./scripts/run_vast.sh
+
+# Full thesis run:
+DATA_DIR=/data N_IMAGES=200 ./scripts/run_vast.sh
+```
+
+`scripts/run_vast.sh` installs the extra deps (torch already ships with the
+template), checks your token/data, prints the GPU, and runs the comparison.
+Results land in `outputs/compare/` (see [What you get](#what-you-get)).
+
+> If `bitsandbytes` errors on a newer CUDA, disable 4-bit (a 24 GB card fits
+> MAIRA-2 in bf16 anyway): `USE_4BIT=0 DATA_DIR=/data N_IMAGES=2 ./scripts/run_vast.sh`
+
+---
+
+## Alternative: run with Docker
+
+Use this on your own machine or any host with Docker + the NVIDIA Container
+Toolkit (not typically needed on Vast).
 
 ### 1. Rent an instance
 - Template: **PyTorch** (or any CUDA 12.1+ image with the NVIDIA Container Toolkit)
