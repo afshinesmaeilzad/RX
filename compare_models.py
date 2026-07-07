@@ -863,10 +863,17 @@ def _paired_bootstrap(a: list[float], b: list[float], n: int = 2000, seed: int =
     }
 
 
+def _per_image_ok(p: dict[str, Any]) -> bool:
+    """True when a per-image payload has the fields needed for aggregation."""
+    if p.get("error"):
+        return False
+    return "detection" in p and "keyword" in p
+
+
 def aggregate_model(per_image: dict[str, dict[str, Any]]) -> dict[str, Any]:
     """Aggregate one model's per-image payloads into thesis metrics + per-image arrays."""
-    valid_items = [(iid, p) for iid, p in per_image.items() if not p.get("error")]
-    n_errors = sum(1 for p in per_image.values() if p.get("error"))
+    valid_items = [(iid, p) for iid, p in per_image.items() if _per_image_ok(p)]
+    n_errors = len(per_image) - len(valid_items)
 
     metrics: dict[str, Any] = {
         "n_images": len(valid_items),
@@ -1560,6 +1567,15 @@ def cmd_report(_: argparse.Namespace) -> None:
 
     if not loaded:
         raise SystemExit("No per-model results found. Run `run --model ...` first.")
+
+    for mk, data in loaded.items():
+        per_image = data.get("per_image", {})
+        skipped = [iid for iid, p in per_image.items() if not _per_image_ok(p)]
+        if skipped:
+            print(
+                f"[WARN] {mk}: skipping {len(skipped)}/{len(per_image)} image(s) "
+                f"without full detection metrics (errors or incomplete payloads)."
+            )
 
     thesis_metrics = {mk: aggregate_model(data.get("per_image", {})) for mk, data in loaded.items()}
     significance = compute_significance(thesis_metrics)
