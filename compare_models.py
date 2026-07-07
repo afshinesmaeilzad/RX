@@ -30,6 +30,9 @@ Read the dataset from a local extract (default) or a Google Drive folder:
 GPU server (Vast.ai RTX 4090 24GB recommended):
     DEVICE=cuda N_IMAGES=10 USE_4BIT=1 python compare_models.py
 
+CURE specifically needs USE_4BIT=1 and peft==0.17.1 (see requirements.txt).
+If CURE emits markdown prose without [cx,cy,w,h] boxes, re-download the adapter.
+
 Run a subset of models:
     MODELS=cure,maira2 python compare_models.py
 
@@ -38,7 +41,7 @@ Caveats:
     - CURE boxes are normalized to its 448x448 CLAHE input; MAIRA-2/MedGemma use
       original-image coordinates. IoU scores are comparable to Padchest-GR GT (xyxy
       on original image) for MAIRA-2/MedGemma; CURE IoU is approximate.
-    - MedGemma 1.5 box output format is less standardized; parsing is best-effort.
+    - MedGemma 1.5 uses Google's JSON box_2d format ([y0,x0,y1,x1] on 0–1000, square-padded input).
     - Rotate any HF token that was ever committed to a notebook or repo.
 """
 
@@ -159,12 +162,17 @@ MODEL_COLORS = {
     "medgemma15": "#ffab40",
 }
 
-GROUNDED_REPORT_PROMPT = "Generate a grounded report."
-MEDGEMMA15_GROUNDED_PROMPT = (
-    "Generate a radiology findings report for this chest X-ray. "
-    "For each finding, include a normalized bounding box as "
-    "[x_min, y_min, x_max, y_max] with values between 0 and 1."
-)
+GROUNDED_REPORT_PROMPT = "Generate a grounded report"
+
+# Official MedGemma 1.5 localization format (Google Health notebook):
+# box_2d is [y0, x0, y1, x1] normalized to [0, 1000] on a square-padded image.
+MEDGEMMA15_GROUNDED_PROMPT = """Instructions:
+The following user query will require outputting bounding boxes. The format of bounding boxes coordinates is [y0, x0, y1, x1] where (y0, x0) must be top-left corner and (y1, x1) the bottom-right corner. This implies that x0 < x1 and y0 < y1. Always normalize the x and y coordinates to the range [0, 1000], meaning that a bounding box starting at 15% of the image width would be associated with an x coordinate of 150. You MUST output a single parseable json list of objects enclosed into ```json...``` brackets, for instance ```json[{"box_2d": [800, 3, 840, 471], "label": "car"}, {"box_2d": [400, 22, 600, 73], "label": "dog"}]``` is a valid output. Now answer to the user query.
+
+Remember "left" refers to the patient's left side where the heart is and sometimes underneath an L in the upper right corner of the image.
+
+Query:
+Describe all radiological findings visible on this chest X-ray. For each finding, include a box_2d and label. Output the final answer in the format "Final Answer: X" where X is a JSON list of objects. The object needs a "box_2d" and "label" key. Answer:"""
 
 
 @dataclass
@@ -364,6 +372,97 @@ def _looks_like_cxcywh(box: list[float]) -> bool:
     return third <= 1.0 and fourth <= 1.0 and third > 0 and fourth > 0
 
 
+def pad_image_to_square(image: Image.Image) -> tuple[Image.Image, dict[str, int]]:
+    """Pad to square (Google MedGemma 1.5 preprocessing). Returns image + unpad metadata."""
+    w, h = image.size
+    s = max(w, h)
+    pad_left = (s - w) // 2 if w < h else 0
+    pad_top = (s - h) // 2 if h < w else 0
+    padded = Image.new("RGB", (s, s), (0, 0, 0))
+    padded.paste(image, (pad_left, pad_top))
+    return padded, {
+        "orig_w": w,
+        "orig_h": h,
+        "pad_left": pad_left,
+        "pad_top": pad_top,
+        "square_size": s,
+    }
+
+
+def medgemma_box_2d_to_xyxy_norm(box_2d: list[float], pad_info: dict[str, int]) -> list[float]:
+    """Convert MedGemma [y0,x0,y1,x1] (0–1000 on padded square) to xyxy normalized on original image."""
+    y0, x0, y1, x1 = [float(v) for v in box_2d]
+    scale = 1000.0 if max(box_2d) > 1.5 else 1.0
+    s = pad_info["square_size"]
+    ow, oh = pad_info["orig_w"], pad_info["orig_h"]
+    pl, pt = pad_info["pad_left"], pad_info["pad_top"]
+
+    x0_px = x0 / scale * s - pl
+    y0_px = y0 / scale * s - pt
+    x1_px = x1 / scale * s - pl
+    y1_px = y1 / scale * s - pt
+
+    return [
+        max(0.0, min(1.0, x0_px / ow)),
+        max(0.0, min(1.0, y0_px / oh)),
+        max(0.0, min(1.0, x1_px / ow)),
+        max(0.0, min(1.0, y1_px / oh)),
+    ]
+
+
+def strip_medgemma_thinking(text: str) -> str:
+    """Keep only the answer portion (after optional Gemma reasoning / thinking trace)."""
+    if "Final Answer:" in text:
+        return text[text.index("Final Answer:"):]
+    json_fence = re.search(r"```json", text, re.IGNORECASE)
+    if json_fence:
+        return text[json_fence.start():]
+    return text
+
+
+def _extract_json_list(text: str) -> list[Any]:
+    """Pull a JSON list from Final Answer, fenced ```json blocks, or raw [...]."""
+    for pattern in (
+        r"Final Answer:\s*(\[[\s\S]*?\])\s*(?:Answer:|$)",
+        r"```json\s*(\[[\s\S]*?\])\s*```",
+        r"(\[[\s\S]*?\])",
+    ):
+        match = re.search(pattern, text, re.IGNORECASE)
+        if not match:
+            continue
+        try:
+            parsed = json.loads(match.group(1))
+            if isinstance(parsed, list):
+                return parsed
+        except json.JSONDecodeError:
+            continue
+    return []
+
+
+def parse_medgemma15_json_findings(
+    text: str,
+    pad_info: dict[str, int],
+) -> tuple[list[dict[str, Any]], str]:
+    """Parse MedGemma 1.5 JSON localization output into grounded findings."""
+    text = strip_medgemma_thinking(text)
+    items = _extract_json_list(text)
+    findings: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or item.get("sentence") or "").strip()
+        raw_box = item.get("box_2d") or item.get("bbox") or item.get("box")
+        if not raw_box or len(raw_box) != 4:
+            continue
+        xyxy = medgemma_box_2d_to_xyxy_norm([float(v) for v in raw_box], pad_info)
+        findings.append({"sentence": label, "boxes": [xyxy]})
+
+    report_text = findings_to_report_text(findings, box_format="xyxy")
+    if not report_text and text.strip():
+        report_text = text.strip()
+    return findings, report_text
+
+
 def findings_to_report_text(findings: list[dict[str, Any]], box_format: str) -> str:
     parts = []
     for f in findings:
@@ -558,12 +657,64 @@ def build_samples(selected_ids: list[str], gt_by_id: dict[str, dict[str, Any]]) 
 # ---------------------------------------------------------------------------
 
 
+def _prepare_medgemma_for_cure_peft(base_model: Any) -> None:
+    """Make embed_tokens and lm_head separate modules so PEFT can load modules_to_save.
+
+    Do NOT switch to AutoModelForCausalLM for the top-level load — that drops the vision
+    encoder and CURE cannot see the X-ray. The KeyError on embed_tokens.weight comes from
+    Gemma weight tying, not from an extra wrapper layer.
+    """
+    lm = getattr(base_model, "language_model", None)
+    if lm is None:
+        return
+
+    lm.config.tie_word_embeddings = False
+    embed = lm.get_input_embeddings()
+    head = lm.get_output_embeddings()
+    if embed is head:
+        vocab, dim = embed.weight.shape
+        new_head = torch.nn.Linear(dim, vocab, bias=False)
+        new_head.weight.data = embed.weight.data.detach().clone()
+        lm.lm_head = new_head
+
+
+def _verify_cure_adapter_loaded(model: Any) -> None:
+    """Fail fast if CURE LoRA / embed weights did not load (base-model prose output)."""
+    modules_to_save = [n for n, _ in model.named_parameters() if "modules_to_save" in n]
+    lora = [n for n, _ in model.named_parameters() if "lora_" in n]
+    if not lora:
+        raise RuntimeError(
+            "[cure] No LoRA weights after adapter load. Re-install peft==0.17.1 and "
+            "clear ~/.cache/huggingface/hub/models--pamessina--medgemma-4b-it-cure"
+        )
+    if not modules_to_save:
+        raise RuntimeError(
+            "[cure] embed_tokens/lm_head (modules_to_save) missing — the adapter is not "
+            "active and output will have no [cx,cy,w,h] boxes. Clear the HF adapter cache "
+            "and re-download; use USE_4BIT=1 and peft==0.17.1."
+        )
+    norms = [
+        p.detach().float().norm().item()
+        for n, p in model.named_parameters()
+        if "modules_to_save" in n
+    ]
+    if not any(n > 0 for n in norms):
+        raise RuntimeError(
+            "[cure] modules_to_save weights are all zero — adapter cache may be corrupt. "
+            "Run: rm -rf ~/.cache/huggingface/hub/models--pamessina--medgemma-4b-it-cure"
+        )
+    print(
+        f"[cure] Adapter loaded: {len(lora)} LoRA tensors, "
+        f"{len(modules_to_save)} modules_to_save tensors"
+    )
+
+
 def run_cure_chat(
     model: Any,
     processor: Any,
     image: Image.Image,
     prompt: str,
-    max_new_tokens: int = 256,
+    max_new_tokens: int = 512,
 ) -> str:
     messages = [
         {
@@ -611,13 +762,20 @@ def load_cure_model(cfg: DeviceConfig) -> tuple[Any, Any]:
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_storage=torch.bfloat16,
         )
         model_kwargs["quantization_config"] = quant_config
-        model_kwargs["device_map"] = {"": 0}
+        model_kwargs["device_map"] = "auto"
     else:
         model_kwargs["device_map"] = None
 
+    # PEFT must wrap embed_tokens + lm_head (modules_to_save in the CURE adapter).
+    # Use AutoModelForImageTextToText (vision + language) — NOT AutoModelForCausalLM,
+    # which would drop the vision tower and break chest X-ray grounding entirely.
+    model_kwargs["tie_word_embeddings"] = False
+
     base_model = AutoModelForImageTextToText.from_pretrained(CURE_BASE_ID, **model_kwargs)
+    _prepare_medgemma_for_cure_peft(base_model)
     if not cfg.use_4bit or cfg.device.type != "cuda":
         base_model.to(cfg.device)
 
@@ -625,6 +783,7 @@ def load_cure_model(cfg: DeviceConfig) -> tuple[Any, Any]:
     if not cfg.use_4bit or cfg.device.type != "cuda":
         model.to(cfg.device)
     model.eval()
+    _verify_cure_adapter_loaded(model)
     return model, processor
 
 
@@ -635,7 +794,7 @@ def infer_cure(sample: ImageSample, model: Any, processor: Any) -> ModelRunResul
         processor,
         sample.cure_image,
         GROUNDED_REPORT_PROMPT,
-        max_new_tokens=256,
+        max_new_tokens=512,
     )
     pred_findings = parse_grounded_report_cxcywh(report_text)
     eval_summary = evaluate_grounded_report(pred_findings, sample.gt_entry, box_format="cxcywh")
@@ -772,14 +931,15 @@ def load_medgemma15_model(cfg: DeviceConfig) -> tuple[Any, Any]:
 
 def infer_medgemma15(sample: ImageSample, model: Any, processor: Any) -> ModelRunResult:
     t0 = time.time()
+    padded_image, pad_info = pad_image_to_square(sample.raw_image)
     report_text = run_cure_chat(
         model,
         processor,
-        sample.raw_image,
+        padded_image,
         MEDGEMMA15_GROUNDED_PROMPT,
-        max_new_tokens=512,
+        max_new_tokens=1000,
     )
-    pred_findings = parse_grounded_report_xyxy(report_text)
+    pred_findings, report_text = parse_medgemma15_json_findings(report_text, pad_info)
     eval_summary = evaluate_grounded_report(pred_findings, sample.gt_entry, box_format="xyxy")
 
     pred_boxes_xyxy = [b for f in pred_findings for b in f.get("boxes", [])]

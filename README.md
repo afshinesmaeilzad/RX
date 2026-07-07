@@ -243,4 +243,14 @@ flowchart LR
   MAIRA-2 (`<4.52`) and the Gemma-3 based models (`>=4.50`).
 - CURE boxes are normalized to its 448×448 CLAHE input; MAIRA-2/MedGemma use the
   original image, so cross-model IoU is approximate (see comments in the script).
+- **CURE troubleshooting:** use `AutoModelForImageTextToText` (not `AutoModelForCausalLM` —
+  CURE needs the vision encoder). If load fails with `KeyError: ...embed_tokens.weight`,
+  ensure latest `compare_models.py` (unties Gemma embeddings before PEFT load) and
+  `peft==0.17.1`. Clear corrupt cache:
+  `rm -rf ~/.cache/huggingface/hub/models--pamessina--medgemma-4b-it-cure`, rerun with
+  `USE_4BIT=1`.
 - MedGemma 1.5's grounded-box output is less standardized; parsing is best-effort.
+
+
+
+

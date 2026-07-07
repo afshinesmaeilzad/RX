@@ -28,6 +28,15 @@ export USE_4BIT="${USE_4BIT:-1}"
 export N_IMAGES="${N_IMAGES:-1}"
 export DATA_DIR="${DATA_DIR:-/data}"
 
+if command -v python3 >/dev/null 2>&1; then
+    PYTHON=python3
+elif command -v python >/dev/null 2>&1; then
+    PYTHON=python
+else
+    echo "[ERROR] python3 not found. Install Python 3 or use a PyTorch template."
+    exit 1
+fi
+
 echo "=================================================="
 echo " RX CXR comparison — Vast.ai (PyTorch, no Docker)"
 echo "=================================================="
@@ -53,14 +62,24 @@ fi
 # 3. Install deps (torch already present in the template) ---------------------
 echo ""
 echo "Installing Python dependencies (this may take a few minutes)..."
-python -m pip install --upgrade pip >/dev/null
-python -m pip install -r requirements.txt
+
+# Install a CUDA 12-compatible torch first so that pip does not pull in
+# a CPU-only or CUDA 13 build when resolving the other deps.
+if ! "$PYTHON" -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
+    echo "  → Installing CUDA 12 compatible torch..."
+    "$PYTHON" -m pip install torch torchvision \
+        --index-url https://download.pytorch.org/whl/cu124 \
+        --quiet
+fi
+
+"$PYTHON" -m pip install --upgrade pip 2>/dev/null || true
+"$PYTHON" -m pip install -r requirements.txt
 
 # 4. Run ---------------------------------------------------------------------
 echo ""
 echo "Running comparison: DEVICE=$DEVICE USE_4BIT=$USE_4BIT N_IMAGES=$N_IMAGES MODELS=${MODELS:-cure,maira2,medgemma15}"
 echo ""
-python compare_models.py
+"$PYTHON" compare_models.py
 
 echo ""
 echo "Done. See outputs/compare/report.md and outputs/compare/plots/"
