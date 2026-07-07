@@ -1,0 +1,6 @@
+# CURE environment (.venv-cure). The CURE adapter was saved with transformers==4.55.4
+# and peft==0.17.1 (other versions break the adapter's modules_to_save mapping,
+# raising KeyError on ...embed_tokens.weight). bf16 full precision.
+-r requirements-base.txt
+transformers==4.55.4
+peft==0.17.1

@@ -1,0 +1,19 @@
+# Shared dependencies for CURE + MAIRA-2 comparison (bf16, NO 4-bit).
+#
+# torch is intentionally NOT listed: the Vast.ai / PyTorch template already ships
+# a CUDA-enabled torch. Install torch manually only if missing:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+#
+# transformers is pinned PER MODEL (see requirements-maira2.txt / requirements-cure.txt),
+# because CURE needs 4.55.4 and MAIRA-2 needs <4.52. bitsandbytes is intentionally
+# absent (no 4-bit). numpy>=2.0 is required (transformers needs numpy.strings).
+
+accelerate>=0.34.0
+huggingface_hub>=0.25.0
+safetensors>=0.4.0
+sentencepiece>=0.1.99
+protobuf>=3.20
+pillow>=10.0
+opencv-python-headless>=4.8
+matplotlib>=3.7
+numpy>=2.0

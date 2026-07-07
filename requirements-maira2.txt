@@ -1,0 +1,4 @@
+# MAIRA-2 environment (.venv-maira2). transformers pinned to 4.51.3 (needs >=4.48,<4.52).
+# No peft. bf16 full precision.
+-r requirements-base.txt
+transformers==4.51.3

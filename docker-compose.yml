@@ -16,17 +16,17 @@ services:
       - .env
     environment:
       DEVICE: ${DEVICE:-cuda}
-      USE_4BIT: ${USE_4BIT:-1}
-      N_IMAGES: ${N_IMAGES:-1}
-      MODELS: ${MODELS:-cure,maira2,medgemma15}
+      N_IMAGES: ${N_IMAGES:-200}
+      SHUFFLE_SEED: ${SHUFFLE_SEED:-42}
+      MODELS: ${MODELS:-cure,maira2}
       DATA_DIR: /data
-      OUTPUT_DIR: /app/outputs
+      OUTPUT_DIR: /app/RX/outputs/compare
       HF_TOKEN: ${HF_TOKEN:-}
     volumes:
       # Dataset (read-only). Point DATA_DIR_HOST at your local copy or rclone mount.
       - ${DATA_DIR_HOST:-./data}:/data:ro
       # Results land here on the host.
-      - ./outputs:/app/outputs
+      - ./outputs:/app/RX/outputs
       # Persist the Hugging Face model cache between runs (avoids re-downloading).
       - hf-cache:/root/.cache/huggingface
     # GPU access (Docker Compose v2 + NVIDIA Container Toolkit).

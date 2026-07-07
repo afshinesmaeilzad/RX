@@ -1,6 +1,9 @@
-# CUDA-enabled image for comparing CURE / MAIRA-2 / MedGemma 1.5 on chest X-rays.
-# The base image already provides a CUDA 12.1 build of PyTorch, so we only add
-# the Python deps in requirements.txt (which deliberately excludes torch).
+# CUDA-enabled image for comparing CURE vs MAIRA-2 on chest X-rays (bf16).
+# The base image ships a CUDA 12.1 build of PyTorch. CURE and MAIRA-2 need
+# conflicting transformers versions, so the two model venvs are built AT RUNTIME
+# by scripts/run_vast.sh (using --system-site-packages to reuse this torch).
+#
+# The recommended path is the Vast.ai PyTorch template without Docker (see README).
 FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -20,19 +23,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY requirements.txt /app/requirements.txt
-RUN python -m pip install --upgrade pip && \
-    python -m pip install -r /app/requirements.txt
+# Copy the whole RX project (compare_models.py, requirements-*.txt, scripts/).
+COPY . /app/RX
+RUN chmod +x /app/RX/entrypoint.sh /app/RX/scripts/run_vast.sh
 
-COPY compare_models.py /app/compare_models.py
-COPY entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
-
-# Defaults; override at runtime with -e / env_file.
+# Defaults; override at runtime with -e / env_file. bf16 only (no 4-bit).
 ENV DEVICE=cuda \
-    USE_4BIT=1 \
-    N_IMAGES=1 \
+    N_IMAGES=200 \
+    SHUFFLE_SEED=42 \
+    MODELS=cure,maira2 \
     DATA_DIR=/data \
-    OUTPUT_DIR=/app/outputs
+    OUTPUT_DIR=/app/RX/outputs/compare
 
-ENTRYPOINT ["/app/entrypoint.sh"]
+ENTRYPOINT ["/app/RX/entrypoint.sh"]

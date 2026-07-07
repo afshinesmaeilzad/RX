@@ -1,53 +1,52 @@
 #!/usr/bin/env python3
 """
-Compare CURE, MAIRA-2, and MedGemma 1.5 on Padchest-GR grounded report generation.
+Compare CURE and MAIRA-2 on PadChest-GR grounded finding localization.
 
-Install (pin transformers for MAIRA-2 + MedGemma compatibility):
-    pip install "transformers==4.51.3" accelerate peft bitsandbytes huggingface_hub \\
-        safetensors sentencepiece pillow opencv-python-headless matplotlib protobuf
+Each model runs in its OWN process/venv (their transformers versions conflict):
+    - MAIRA-2 : transformers==4.51.3            (requirements-maira2.txt)
+    - CURE    : transformers==4.55.4 + peft     (requirements-cure.txt)
 
-Hugging Face gating (accept terms before first run):
-    - https://huggingface.co/pamessina/medgemma-4b-it-cure
-    - https://huggingface.co/microsoft/maira-2
-    - https://huggingface.co/google/medgemma-1.5-4b-it
+Everything runs in bf16 FULL PRECISION (no 4-bit / no bitsandbytes), so a single
+GPU with >=24 GB VRAM is recommended (each model is loaded one at a time).
 
-Auth:
-    export HF_TOKEN="hf_..."   # or: huggingface-cli login
+The pipeline is three subcommands so the heavy model load happens in the right venv:
 
-Mac CPU verify (1 image, slow but correct for CURE bf16):
-    DEVICE=cpu N_IMAGES=1 python compare_models.py
+    python compare_models.py select                 # pin the shared image list (once)
+    python compare_models.py run --model maira2      # in .venv-maira2
+    python compare_models.py run --model cure        # in .venv-cure
+    python compare_models.py report                  # aggregate + report (no transformers)
 
-Read the dataset from a local extract (default) or a Google Drive folder:
-    # Local: dataset next to this script (Padchest_GR_files/, grounded_reports_*.json)
-    DEVICE=cpu N_IMAGES=1 python compare_models.py
-    # Google Drive on Colab (auto-mounts, nested Padchest_GR_files/PadChest_GR/):
-    MOUNT_DRIVE=1 \\
-    DATA_DIR="/content/drive/MyDrive/PadChest/extracted/BIMCV-Padchest-GR" \\
-    DEVICE=cuda N_IMAGES=1 python compare_models.py
-    # Or point directly at any mounted path:
-    DATA_DIR="/path/to/BIMCV-Padchest-GR" python compare_models.py
+The `select` step writes outputs/compare/image_list.json ({seed, n_images, selected}).
+Both `run` invocations read that SAME file, so the two models score identical images.
+Each `run` writes outputs/compare/per_model/<model>.json with, per image, the simple
+{keyword, box} findings (the payload a later OpenAI step will turn into a narrative
+report) plus all per-image detection numbers. `report` aggregates them.
 
-GPU server (Vast.ai RTX 4090 24GB recommended):
-    DEVICE=cuda N_IMAGES=10 USE_4BIT=1 python compare_models.py
+Scope (per project decision):
+    - Models output only KEYWORD findings + boxes, not a full narrative report.
+    - Metrics are detection (box IoU in original pixel space, greedy multi-box matching,
+      P/R/F1 @ 0.3/0.5, a score-free mAP-like sweep) + a lightweight keyword-vs-GT-label
+      match (stdlib difflib). NO RadGraph/CheXbert/BLEU/ROUGE.
+    - Bootstrap CIs + a paired significance test back the CURE-vs-MAIRA claims.
 
-CURE specifically needs USE_4BIT=1 and peft==0.17.1 (see requirements.txt).
-If CURE emits markdown prose without [cx,cy,w,h] boxes, re-download the adapter.
-
-Run a subset of models:
-    MODELS=cure,maira2 python compare_models.py
-
-Caveats:
-    - Models are loaded sequentially (MAIRA-2 is 7B; all three won't fit together).
-    - CURE boxes are normalized to its 448x448 CLAHE input; MAIRA-2/MedGemma use
-      original-image coordinates. IoU scores are comparable to Padchest-GR GT (xyxy
-      on original image) for MAIRA-2/MedGemma; CURE IoU is approximate.
-    - MedGemma 1.5 uses Google's JSON box_2d format ([y0,x0,y1,x1] on 0–1000, square-padded input).
-    - Rotate any HF token that was ever committed to a notebook or repo.
+Env vars:
+    DATA_DIR      dataset root (grounded_reports_*.json + Padchest_GR_files/)  [default: script dir]
+    JSON_PATH     override GT json path
+    IMAGES_DIR    override images dir
+    OUTPUT_DIR    output dir           [default: <script>/outputs/compare]
+    N_IMAGES      how many images      [default: 200]
+    SHUFFLE_SEED  selection seed       [default: 42]
+    DEVICE        cuda | mps | cpu     [default: cpu]
+    MODELS        subset for `run`/`report` order [default: cure,maira2]
+    SAVE_FIGURES  1 = save per-image preview pngs in `run` [default: 0]
+    HF_TOKEN      HuggingFace token (gated MAIRA-2 / MedGemma-4B base + CURE adapter)
 """
 
 from __future__ import annotations
 
+import argparse
 import csv
+import difflib
 import gc
 import json
 import os
@@ -69,7 +68,6 @@ matplotlib.use(os.environ.get("MPLBACKEND", "Agg"))
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from huggingface_hub import login
 from PIL import Image, ImageDraw
 
 # ---------------------------------------------------------------------------
@@ -118,7 +116,6 @@ def _resolve_images_dir(data_dir: str) -> str:
     for candidate in candidates:
         if _dir_has_images(candidate):
             return candidate
-    # Fall back to the first existing directory, else the last candidate.
     for candidate in candidates:
         if os.path.isdir(candidate):
             return candidate
@@ -127,30 +124,28 @@ def _resolve_images_dir(data_dir: str) -> str:
 
 _maybe_mount_drive()
 
-# Where the dataset lives. Defaults to the script dir (local extract). To read
-# from a mounted Google Drive, set:
-#   DATA_DIR="/content/drive/MyDrive/PadChest/extracted/BIMCV-Padchest-GR" MOUNT_DRIVE=1
 DATA_DIR = os.environ.get("DATA_DIR", BASE_DIR)
-
 JSON_PATH = os.environ.get("JSON_PATH") or os.path.join(DATA_DIR, "grounded_reports_20240819.json")
 IMAGES_DIR = os.environ.get("IMAGES_DIR") or _resolve_images_dir(DATA_DIR)
-# Outputs always go to a local, writable directory (not onto Drive by default).
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR") or os.path.join(BASE_DIR, "outputs", "compare")
 
-N_IMAGES = int(os.environ.get("N_IMAGES", "1"))
+PER_MODEL_DIR = os.path.join(OUTPUT_DIR, "per_model")
+IMAGE_LIST_PATH = os.path.join(OUTPUT_DIR, "image_list.json")
+
+N_IMAGES = int(os.environ.get("N_IMAGES", "200"))
 SHUFFLE_SEED = int(os.environ["SHUFFLE_SEED"]) if os.environ.get("SHUFFLE_SEED") else 42
 DEFAULT_VERIFY_IMAGE = "106997070894779966614346591942916625787_fsxv2a.png"
 
+ALL_MODELS = ["cure", "maira2"]
 MODELS = [
     m.strip().lower()
-    for m in os.environ.get("MODELS", "cure,maira2,medgemma15").split(",")
+    for m in os.environ.get("MODELS", "cure,maira2").split(",")
     if m.strip()
 ]
 
 CURE_BASE_ID = "google/medgemma-4b-it"
 CURE_ADAPTER_ID = "pamessina/medgemma-4b-it-cure"
 MAIRA2_ID = "microsoft/maira-2"
-MEDGEMMA15_ID = "google/medgemma-1.5-4b-it"
 
 CURE_IMAGE_SIZE = 448
 CURE_CLAHE_CLIP_LIMIT = 3.0
@@ -159,27 +154,35 @@ CURE_CLAHE_TILE_GRID = (8, 8)
 MODEL_COLORS = {
     "cure": "#ff5252",
     "maira2": "#448aff",
-    "medgemma15": "#ffab40",
 }
 
-GROUNDED_REPORT_PROMPT = "Generate a grounded report"
+# Simple prompt (per project decision). CURE emits short grounded findings + boxes.
+GROUNDED_REPORT_PROMPT = "Generate a grounded report."
 
-# Official MedGemma 1.5 localization format (Google Health notebook):
-# box_2d is [y0, x0, y1, x1] normalized to [0, 1000] on a square-padded image.
-MEDGEMMA15_GROUNDED_PROMPT = """Instructions:
-The following user query will require outputting bounding boxes. The format of bounding boxes coordinates is [y0, x0, y1, x1] where (y0, x0) must be top-left corner and (y1, x1) the bottom-right corner. This implies that x0 < x1 and y0 < y1. Always normalize the x and y coordinates to the range [0, 1000], meaning that a bounding box starting at 15% of the image width would be associated with an x coordinate of 150. You MUST output a single parseable json list of objects enclosed into ```json...``` brackets, for instance ```json[{"box_2d": [800, 3, 840, 471], "label": "car"}, {"box_2d": [400, 22, 600, 73], "label": "dog"}]``` is a valid output. Now answer to the user query.
+# Detection IoU thresholds. Headline reporting uses 0.3 and 0.5; the sweep
+# 0.50:0.05:0.95 feeds a score-free mAP-like surrogate (models emit no box scores).
+HEADLINE_THRESHOLDS = (0.3, 0.5)
+SWEEP_THRESHOLDS = tuple(round(0.5 + 0.05 * i, 2) for i in range(10))  # 0.50 .. 0.95
+ALL_THRESHOLDS = tuple(sorted({0.3, *SWEEP_THRESHOLDS}))
 
-Remember "left" refers to the patient's left side where the heart is and sometimes underneath an L in the upper right corner of the image.
+# Keyword-match acceptance ratio (stdlib difflib).
+KEYWORD_MATCH_RATIO = 0.8
 
-Query:
-Describe all radiological findings visible on this chest X-ray. For each finding, include a box_2d and label. Output the final answer in the format "Final Answer: X" where X is a JSON list of objects. The object needs a "box_2d" and "label" key. Answer:"""
+
+def _tk(t: float) -> str:
+    """Canonical string key for a threshold (e.g. 0.5 -> '0.50')."""
+    return f"{t:.2f}"
+
+
+# ---------------------------------------------------------------------------
+# Dataclasses
+# ---------------------------------------------------------------------------
 
 
 @dataclass
 class DeviceConfig:
     device: torch.device
     dtype: torch.dtype
-    use_4bit: bool
 
 
 @dataclass
@@ -187,8 +190,9 @@ class ImageSample:
     image_id: str
     image_path: str
     gt_entry: dict[str, Any]
-    raw_image: Image.Image
-    cure_image: Image.Image
+    raw_image: Image.Image | None = None
+    cure_image: Image.Image | None = None
+    orig_size: tuple[int, int] = (0, 0)  # (W, H) of the ORIGINAL image, for pixel-space IoU
     gt_boxes_xyxy: list[list[float]] = field(default_factory=list)
     gt_sentences: list[str] = field(default_factory=list)
 
@@ -200,8 +204,6 @@ class ModelRunResult:
     pred_findings: list[dict[str, Any]]
     box_format: str
     latency_s: float
-    eval_summary: dict[str, Any] | None = None
-    display_image: Image.Image | None = None
     error: str | None = None
 
 
@@ -211,6 +213,8 @@ class ModelRunResult:
 
 
 def setup_hf_auth() -> None:
+    from huggingface_hub import login
+
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     if token:
         login(token=token)
@@ -219,27 +223,22 @@ def setup_hf_auth() -> None:
 
 
 def resolve_device_config() -> DeviceConfig:
+    """bf16 full precision only. No quantization."""
     requested = os.environ.get("DEVICE", os.environ.get("CURE_DEVICE", "cpu")).lower()
-    use_4bit_env = os.environ.get("USE_4BIT")
 
     if requested == "cuda" and torch.cuda.is_available():
         device = torch.device("cuda")
-        dtype = torch.bfloat16
-        use_4bit = use_4bit_env != "0" if use_4bit_env is not None else True
     elif requested == "mps" and torch.backends.mps.is_available():
         device = torch.device("mps")
-        dtype = torch.bfloat16
-        use_4bit = False
         print("[WARN] MPS is experimental; use DEVICE=cpu if outputs are empty.")
     else:
         device = torch.device("cpu")
-        dtype = torch.bfloat16
-        use_4bit = False
         if requested == "cuda":
             print("[WARN] CUDA requested but unavailable; falling back to CPU.")
 
-    print(f"Device: {device}  dtype: {dtype}  use_4bit: {use_4bit}")
-    return DeviceConfig(device=device, dtype=dtype, use_4bit=use_4bit)
+    dtype = torch.bfloat16
+    print(f"Device: {device}  dtype: {dtype}  (bf16 full precision, no 4-bit)")
+    return DeviceConfig(device=device, dtype=dtype)
 
 
 def free_model(*objs: Any) -> None:
@@ -251,7 +250,7 @@ def free_model(*objs: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Image loading / drawing helpers
+# Image loading / geometry / drawing
 # ---------------------------------------------------------------------------
 
 
@@ -278,7 +277,6 @@ def load_raw_xray_rgb(path: str) -> Image.Image:
 def load_xray_as_rgb_cure(path: str) -> Image.Image:
     """Official CURE pipeline: CLAHE + resize 448x448."""
     img_np = np.array(load_raw_xray_rgb(path))
-
     clahe = cv2.createCLAHE(
         clipLimit=CURE_CLAHE_CLIP_LIMIT,
         tileGridSize=CURE_CLAHE_TILE_GRID,
@@ -298,13 +296,6 @@ def cxcywh_to_xyxy(box: list[float]) -> list[float]:
     return [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2]
 
 
-def xyxy_to_cxcywh(box: list[float]) -> list[float]:
-    x1, y1, x2, y2 = box
-    w = x2 - x1
-    h = y2 - y1
-    return [x1 + w / 2, y1 + h / 2, w, h]
-
-
 def iou_xyxy(a: list[float], b: list[float]) -> float:
     ix1 = max(a[0], b[0])
     iy1 = max(a[1], b[1])
@@ -320,6 +311,7 @@ def iou_xyxy(a: list[float], b: list[float]) -> float:
 
 
 def draw_xyxy_boxes(image: Image.Image, boxes: list[list[float]], color: str, width: int = 4) -> Image.Image:
+    """Draw normalized [0,1] xyxy boxes."""
     img = image.copy()
     draw = ImageDraw.Draw(img)
     w, h = img.size
@@ -333,12 +325,19 @@ def draw_cxcywh_boxes(image: Image.Image, boxes: list[list[float]], color: str, 
     return draw_xyxy_boxes(image, [cxcywh_to_xyxy(b) for b in boxes], color=color, width=width)
 
 
-def extract_boxes_from_text(text: str) -> list[list[float]]:
-    pattern = (
-        r"\[\s*([0-9]*\.?[0-9]+)\s*,\s*([0-9]*\.?[0-9]+)\s*,"
-        r"\s*([0-9]*\.?[0-9]+)\s*,\s*([0-9]*\.?[0-9]+)\s*\]"
-    )
-    return [[float(x) for x in m.groups()] for m in re.finditer(pattern, text)]
+def finding_boxes_to_xyxy_norm(box: list[float], box_format: str) -> list[float]:
+    """Normalize a single predicted box (cxcywh or xyxy) to normalized xyxy [0,1]."""
+    return cxcywh_to_xyxy(box) if box_format == "cxcywh" else [float(x) for x in box]
+
+
+def norm_xyxy_to_px(box_norm: list[float], size: tuple[int, int]) -> list[float]:
+    w, h = size
+    return [box_norm[0] * w, box_norm[1] * h, box_norm[2] * w, box_norm[3] * h]
+
+
+# ---------------------------------------------------------------------------
+# Parsing (CURE grounded output -> findings)
+# ---------------------------------------------------------------------------
 
 
 def parse_grounded_report_cxcywh(text: str) -> list[dict[str, Any]]:
@@ -357,112 +356,6 @@ def parse_grounded_report_cxcywh(text: str) -> list[dict[str, Any]]:
     return findings
 
 
-def parse_grounded_report_xyxy(text: str) -> list[dict[str, Any]]:
-    findings = parse_grounded_report_cxcywh(text)
-    for finding in findings:
-        finding["boxes"] = [cxcywh_to_xyxy(b) if _looks_like_cxcywh(b) else b for b in finding["boxes"]]
-    return findings
-
-
-def _looks_like_cxcywh(box: list[float]) -> bool:
-    """Heuristic: cxcywh boxes usually have all coords <= 1 and w/h <= 1."""
-    if len(box) != 4:
-        return False
-    _, _, third, fourth = box
-    return third <= 1.0 and fourth <= 1.0 and third > 0 and fourth > 0
-
-
-def pad_image_to_square(image: Image.Image) -> tuple[Image.Image, dict[str, int]]:
-    """Pad to square (Google MedGemma 1.5 preprocessing). Returns image + unpad metadata."""
-    w, h = image.size
-    s = max(w, h)
-    pad_left = (s - w) // 2 if w < h else 0
-    pad_top = (s - h) // 2 if h < w else 0
-    padded = Image.new("RGB", (s, s), (0, 0, 0))
-    padded.paste(image, (pad_left, pad_top))
-    return padded, {
-        "orig_w": w,
-        "orig_h": h,
-        "pad_left": pad_left,
-        "pad_top": pad_top,
-        "square_size": s,
-    }
-
-
-def medgemma_box_2d_to_xyxy_norm(box_2d: list[float], pad_info: dict[str, int]) -> list[float]:
-    """Convert MedGemma [y0,x0,y1,x1] (0–1000 on padded square) to xyxy normalized on original image."""
-    y0, x0, y1, x1 = [float(v) for v in box_2d]
-    scale = 1000.0 if max(box_2d) > 1.5 else 1.0
-    s = pad_info["square_size"]
-    ow, oh = pad_info["orig_w"], pad_info["orig_h"]
-    pl, pt = pad_info["pad_left"], pad_info["pad_top"]
-
-    x0_px = x0 / scale * s - pl
-    y0_px = y0 / scale * s - pt
-    x1_px = x1 / scale * s - pl
-    y1_px = y1 / scale * s - pt
-
-    return [
-        max(0.0, min(1.0, x0_px / ow)),
-        max(0.0, min(1.0, y0_px / oh)),
-        max(0.0, min(1.0, x1_px / ow)),
-        max(0.0, min(1.0, y1_px / oh)),
-    ]
-
-
-def strip_medgemma_thinking(text: str) -> str:
-    """Keep only the answer portion (after optional Gemma reasoning / thinking trace)."""
-    if "Final Answer:" in text:
-        return text[text.index("Final Answer:"):]
-    json_fence = re.search(r"```json", text, re.IGNORECASE)
-    if json_fence:
-        return text[json_fence.start():]
-    return text
-
-
-def _extract_json_list(text: str) -> list[Any]:
-    """Pull a JSON list from Final Answer, fenced ```json blocks, or raw [...]."""
-    for pattern in (
-        r"Final Answer:\s*(\[[\s\S]*?\])\s*(?:Answer:|$)",
-        r"```json\s*(\[[\s\S]*?\])\s*```",
-        r"(\[[\s\S]*?\])",
-    ):
-        match = re.search(pattern, text, re.IGNORECASE)
-        if not match:
-            continue
-        try:
-            parsed = json.loads(match.group(1))
-            if isinstance(parsed, list):
-                return parsed
-        except json.JSONDecodeError:
-            continue
-    return []
-
-
-def parse_medgemma15_json_findings(
-    text: str,
-    pad_info: dict[str, int],
-) -> tuple[list[dict[str, Any]], str]:
-    """Parse MedGemma 1.5 JSON localization output into grounded findings."""
-    text = strip_medgemma_thinking(text)
-    items = _extract_json_list(text)
-    findings: list[dict[str, Any]] = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        label = str(item.get("label") or item.get("sentence") or "").strip()
-        raw_box = item.get("box_2d") or item.get("bbox") or item.get("box")
-        if not raw_box or len(raw_box) != 4:
-            continue
-        xyxy = medgemma_box_2d_to_xyxy_norm([float(v) for v in raw_box], pad_info)
-        findings.append({"sentence": label, "boxes": [xyxy]})
-
-    report_text = findings_to_report_text(findings, box_format="xyxy")
-    if not report_text and text.strip():
-        report_text = text.strip()
-    return findings, report_text
-
-
 def findings_to_report_text(findings: list[dict[str, Any]], box_format: str) -> str:
     parts = []
     for f in findings:
@@ -476,102 +369,131 @@ def findings_to_report_text(findings: list[dict[str, Any]], box_format: str) -> 
     return ". ".join(p for p in parts if p)
 
 
-def evaluate_grounded_report(
+# ---------------------------------------------------------------------------
+# Evaluation: detection (pixel-space) + keyword match
+# ---------------------------------------------------------------------------
+
+
+def greedy_match_boxes(
+    pred_boxes: list[list[float]],
+    gt_boxes: list[list[float]],
+) -> list[tuple[int, int, float]]:
+    """Greedy one-to-one matching by descending IoU. Returns (pred_idx, gt_idx, iou)."""
+    candidates: list[tuple[float, int, int]] = []
+    for i, pb in enumerate(pred_boxes):
+        for j, gb in enumerate(gt_boxes):
+            iou = iou_xyxy(pb, gb)
+            if iou > 0:
+                candidates.append((iou, i, j))
+    candidates.sort(reverse=True)
+
+    used_p: set[int] = set()
+    used_g: set[int] = set()
+    matches: list[tuple[int, int, float]] = []
+    for iou, i, j in candidates:
+        if i in used_p or j in used_g:
+            continue
+        used_p.add(i)
+        used_g.add(j)
+        matches.append((i, j, iou))
+    return matches
+
+
+def evaluate_detection(
     pred_findings: list[dict[str, Any]],
     gt_entry: dict[str, Any],
-    box_format: str = "cxcywh",
-    iou_thresholds: tuple[float, ...] = (0.3, 0.5),
+    box_format: str,
+    orig_size: tuple[int, int],
 ) -> dict[str, Any]:
-    gt_findings = []
+    """
+    IoU is computed in ORIGINAL-image PIXEL coordinates for every model, so aspect
+    ratio is honoured identically (CURE cxcywh, MAIRA xyxy and GT are all mapped to
+    original W x H px first). Matching is greedy one-to-one over ALL predicted boxes.
+    """
+    pred_px: list[list[float]] = []
+    for f in pred_findings:
+        for b in f.get("boxes") or []:
+            xyxy = finding_boxes_to_xyxy_norm(b, box_format)
+            pred_px.append(norm_xyxy_to_px(xyxy, orig_size))
+
+    gt_px: list[list[float]] = []
+    gt_meta: list[dict[str, Any]] = []
     for f in gt_entry.get("findings", []) or []:
-        for box in f.get("boxes", []) or []:
-            gt_findings.append({
-                "sentence": f.get("sentence_en", ""),
-                "labels": f.get("labels", []) or [],
-                "box_xyxy": box,
-                "matched": False,
-                "best_iou": 0.0,
-            })
+        for box in f.get("boxes") or []:  # GT boxes are normalized xyxy
+            gt_px.append(norm_xyxy_to_px([float(x) for x in box], orig_size))
+            gt_meta.append({"labels": f.get("labels") or [], "sentence": f.get("sentence_en", "")})
 
-    rows = []
-    for p in pred_findings:
-        if not p.get("boxes"):
-            rows.append({
-                "pred": p.get("sentence", ""),
-                "iou": None,
-                "matched_gt": None,
-                "matched_gt_labels": [],
-            })
-            continue
+    matches = greedy_match_boxes(pred_px, gt_px)
+    matched_ious = [iou for _, _, iou in matches]
 
-        box = p["boxes"][0]
-        pred_xyxy = cxcywh_to_xyxy(box) if box_format == "cxcywh" else list(box)
+    gt_best = [0.0] * len(gt_px)
+    for _, j, iou in matches:
+        gt_best[j] = iou
 
-        best = (-1.0, None)
-        for i, g in enumerate(gt_findings):
-            if g["matched"]:
-                continue
-            score = iou_xyxy(g["box_xyxy"], pred_xyxy)
-            if score > best[0]:
-                best = (score, i)
-
-        if best[1] is not None and best[0] > 0:
-            gt_findings[best[1]]["matched"] = True
-            gt_findings[best[1]]["best_iou"] = best[0]
-            rows.append({
-                "pred": p.get("sentence", ""),
-                "iou": best[0],
-                "matched_gt": gt_findings[best[1]]["sentence"],
-                "matched_gt_labels": gt_findings[best[1]]["labels"],
-            })
-        else:
-            rows.append({
-                "pred": p.get("sentence", ""),
-                "iou": 0.0,
-                "matched_gt": None,
-                "matched_gt_labels": [],
-            })
-
-    valid_ious = [r["iou"] for r in rows if r["iou"] is not None]
-    mean_iou = sum(valid_ious) / len(valid_ious) if valid_ious else 0.0
-    n_gt = len(gt_findings)
-    recalls = {
-        f"recall@{t}": (
-            sum(
-                1
-                for g in gt_findings
-                if g["matched"]
-                and any(
-                    r["matched_gt"] == g["sentence"]
-                    and r["iou"] is not None
-                    and r["iou"] >= t
-                    for r in rows
-                )
-            )
-            / n_gt
-            if n_gt
-            else 0.0
-        )
-        for t in iou_thresholds
-    }
+    n_pred = len(pred_px)
+    n_gt = len(gt_px)
+    per_threshold: dict[str, dict[str, int]] = {}
+    for t in ALL_THRESHOLDS:
+        tp = sum(1 for iou in matched_ious if iou >= t)
+        per_threshold[_tk(t)] = {"tp": tp, "fp": n_pred - tp, "fn": n_gt - tp}
 
     return {
-        "rows": rows,
-        "mean_iou": mean_iou,
-        "n_predicted": len(pred_findings),
-        "n_predicted_with_box": sum(1 for p in pred_findings if p.get("boxes")),
+        "n_pred_boxes": n_pred,
         "n_gt_boxes": n_gt,
-        "missed_gt": [g["sentence"] for g in gt_findings if not g["matched"]],
+        "matched_ious": matched_ious,
+        "mean_iou": (sum(matched_ious) / len(matched_ious)) if matched_ious else 0.0,
+        "recall@0.3": (sum(1 for i in matched_ious if i >= 0.3) / n_gt) if n_gt else 0.0,
+        "recall@0.5": (sum(1 for i in matched_ious if i >= 0.5) / n_gt) if n_gt else 0.0,
+        "per_threshold": per_threshold,
         "gt_detail": [
-            {
-                "sentence": g["sentence"],
-                "labels": g["labels"],
-                "best_iou": g["best_iou"],
-            }
-            for g in gt_findings
+            {"labels": m["labels"], "best_iou": b} for m, b in zip(gt_meta, gt_best)
         ],
-        **recalls,
     }
+
+
+def _norm_text(s: Any) -> str:
+    return re.sub(r"\s+", " ", str(s).strip().lower())
+
+
+def _keyword_match(a: str, b: str) -> bool:
+    if not a or not b:
+        return False
+    if a == b or a in b or b in a:
+        return True
+    return difflib.SequenceMatcher(None, a, b).ratio() >= KEYWORD_MATCH_RATIO
+
+
+def evaluate_keywords(
+    pred_findings: list[dict[str, Any]],
+    gt_entry: dict[str, Any],
+) -> dict[str, Any]:
+    """Lightweight keyword-vs-GT-label match (stdlib difflib, no NLG libs)."""
+    preds = [_norm_text(f.get("sentence", "")) for f in pred_findings]
+    preds = [p for p in preds if p]
+
+    gts: list[str] = []
+    for f in gt_entry.get("findings", []) or []:
+        labels = [_norm_text(l) for l in (f.get("labels") or []) if _norm_text(l)]
+        if labels:
+            gts.extend(labels)
+        else:
+            s = _norm_text(f.get("sentence_en", ""))
+            if s:
+                gts.append(s)
+
+    used_g: set[int] = set()
+    tp = 0
+    for p in preds:
+        for j, g in enumerate(gts):
+            if j in used_g:
+                continue
+            if _keyword_match(p, g):
+                used_g.add(j)
+                tp += 1
+                break
+    fp = len(preds) - tp
+    fn = len(gts) - tp
+    return {"tp": tp, "fp": fp, "fn": fn, "n_pred": len(preds), "n_gt": len(gts)}
 
 
 # ---------------------------------------------------------------------------
@@ -606,14 +528,12 @@ def select_images(
     candidates = [fn for fn in all_files if fn in gt_by_id and has_gt_box(gt_by_id[fn])]
 
     selected: list[str] = []
-    if prefer_image and prefer_image in gt_by_id and has_gt_box(gt_by_id[prefer_image]):
-        if prefer_image in candidates:
-            selected.append(prefer_image)
-            candidates = [c for c in candidates if c != prefer_image]
+    if prefer_image and prefer_image in candidates:
+        selected.append(prefer_image)
+        candidates = [c for c in candidates if c != prefer_image]
 
     if shuffle_seed is not None:
-        rng = random.Random(shuffle_seed)
-        rng.shuffle(candidates)
+        random.Random(shuffle_seed).shuffle(candidates)
 
     for fn in candidates:
         if len(selected) >= n_images:
@@ -625,57 +545,41 @@ def select_images(
     return selected[:n_images]
 
 
-def build_samples(selected_ids: list[str], gt_by_id: dict[str, dict[str, Any]]) -> list[ImageSample]:
-    samples = []
-    for image_id in selected_ids:
-        image_path = os.path.join(IMAGES_DIR, image_id)
-        if not os.path.exists(image_path):
-            raise FileNotFoundError(f"Missing image: {image_path}")
+def build_sample(image_id: str, gt_by_id: dict[str, dict[str, Any]], which: str) -> ImageSample:
+    """Build one sample, loading only the image variant the model needs."""
+    image_path = os.path.join(IMAGES_DIR, image_id)
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"Missing image: {image_path}")
 
-        gt_entry = gt_by_id[image_id]
-        gt_boxes, gt_sentences = [], []
-        for f in gt_entry.get("findings", []) or []:
-            gt_sentences.append(f.get("sentence_en", ""))
-            gt_boxes.extend(f.get("boxes") or [])
+    gt_entry = gt_by_id[image_id]
+    gt_boxes, gt_sentences = [], []
+    for f in gt_entry.get("findings", []) or []:
+        gt_sentences.append(f.get("sentence_en", ""))
+        gt_boxes.extend(f.get("boxes") or [])
 
-        samples.append(
-            ImageSample(
-                image_id=image_id,
-                image_path=image_path,
-                gt_entry=gt_entry,
-                raw_image=load_raw_xray_rgb(image_path),
-                cure_image=load_xray_as_rgb_cure(image_path),
-                gt_boxes_xyxy=gt_boxes,
-                gt_sentences=gt_sentences,
-            )
-        )
-    return samples
+    # Original (W, H) from the file header (cheap, no full decode) - CURE resizes to a
+    # 448 square, but IoU must be evaluated in ORIGINAL pixel space for both models.
+    with Image.open(image_path) as _im:
+        orig_size = _im.size  # (W, H)
+
+    sample = ImageSample(
+        image_id=image_id,
+        image_path=image_path,
+        gt_entry=gt_entry,
+        orig_size=orig_size,
+        gt_boxes_xyxy=gt_boxes,
+        gt_sentences=gt_sentences,
+    )
+    if which == "cure":
+        sample.cure_image = load_xray_as_rgb_cure(image_path)
+    else:
+        sample.raw_image = load_raw_xray_rgb(image_path)
+    return sample
 
 
 # ---------------------------------------------------------------------------
-# Model runners
+# Model runners (bf16 full precision)
 # ---------------------------------------------------------------------------
-
-
-def _prepare_medgemma_for_cure_peft(base_model: Any) -> None:
-    """Make embed_tokens and lm_head separate modules so PEFT can load modules_to_save.
-
-    Do NOT switch to AutoModelForCausalLM for the top-level load — that drops the vision
-    encoder and CURE cannot see the X-ray. The KeyError on embed_tokens.weight comes from
-    Gemma weight tying, not from an extra wrapper layer.
-    """
-    lm = getattr(base_model, "language_model", None)
-    if lm is None:
-        return
-
-    lm.config.tie_word_embeddings = False
-    embed = lm.get_input_embeddings()
-    head = lm.get_output_embeddings()
-    if embed is head:
-        vocab, dim = embed.weight.shape
-        new_head = torch.nn.Linear(dim, vocab, bias=False)
-        new_head.weight.data = embed.weight.data.detach().clone()
-        lm.lm_head = new_head
 
 
 def _verify_cure_adapter_loaded(model: Any) -> None:
@@ -689,9 +593,8 @@ def _verify_cure_adapter_loaded(model: Any) -> None:
         )
     if not modules_to_save:
         raise RuntimeError(
-            "[cure] embed_tokens/lm_head (modules_to_save) missing — the adapter is not "
-            "active and output will have no [cx,cy,w,h] boxes. Clear the HF adapter cache "
-            "and re-download; use USE_4BIT=1 and peft==0.17.1."
+            "[cure] embed_tokens/lm_head (modules_to_save) missing - the adapter is not "
+            "active and output will have no [cx,cy,w,h] boxes."
         )
     norms = [
         p.detach().float().norm().item()
@@ -700,7 +603,7 @@ def _verify_cure_adapter_loaded(model: Any) -> None:
     ]
     if not any(n > 0 for n in norms):
         raise RuntimeError(
-            "[cure] modules_to_save weights are all zero — adapter cache may be corrupt. "
+            "[cure] modules_to_save weights are all zero - adapter cache may be corrupt. "
             "Run: rm -rf ~/.cache/huggingface/hub/models--pamessina--medgemma-4b-it-cure"
         )
     print(
@@ -745,43 +648,31 @@ def run_cure_chat(
 
 
 def load_cure_model(cfg: DeviceConfig) -> tuple[Any, Any]:
+    """Official CURE recipe (transformers==4.55.4 + peft==0.17.1), bf16 full precision.
+
+    The tied MedGemma-4B base is loaded directly and the CURE LoRA adapter is attached
+    with PeftModel.from_pretrained. We do NOT untie embeddings or clone lm_head - that
+    breaks peft's modules_to_save mapping (KeyError on ...embed_tokens.weight).
+    """
     from peft import PeftModel
-    from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
+    from transformers import AutoModelForImageTextToText, AutoProcessor
 
     processor = AutoProcessor.from_pretrained(CURE_BASE_ID)
     processor.tokenizer.padding_side = "left"
 
-    quant_config = None
-    model_kwargs: dict[str, Any] = {
-        "torch_dtype": cfg.dtype,
-        "low_cpu_mem_usage": True,
-    }
-    if cfg.use_4bit and cfg.device.type == "cuda":
-        quant_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_storage=torch.bfloat16,
-        )
-        model_kwargs["quantization_config"] = quant_config
-        model_kwargs["device_map"] = "auto"
-    else:
-        model_kwargs["device_map"] = None
-
-    # PEFT must wrap embed_tokens + lm_head (modules_to_save in the CURE adapter).
-    # Use AutoModelForImageTextToText (vision + language) — NOT AutoModelForCausalLM,
-    # which would drop the vision tower and break chest X-ray grounding entirely.
-    model_kwargs["tie_word_embeddings"] = False
-
-    base_model = AutoModelForImageTextToText.from_pretrained(CURE_BASE_ID, **model_kwargs)
-    _prepare_medgemma_for_cure_peft(base_model)
-    if not cfg.use_4bit or cfg.device.type != "cuda":
-        base_model.to(cfg.device)
+    on_cuda = cfg.device.type == "cuda"
+    base_model = AutoModelForImageTextToText.from_pretrained(
+        CURE_BASE_ID,
+        torch_dtype=torch.bfloat16,
+        device_map="auto" if on_cuda else None,
+        low_cpu_mem_usage=True,
+    )
+    if not on_cuda:
+        base_model = base_model.to(cfg.device)
 
     model = PeftModel.from_pretrained(base_model, CURE_ADAPTER_ID)
-    if not cfg.use_4bit or cfg.device.type != "cuda":
-        model.to(cfg.device)
+    if not on_cuda:
+        model = model.to(cfg.device)
     model.eval()
     _verify_cure_adapter_loaded(model)
     return model, processor
@@ -797,46 +688,27 @@ def infer_cure(sample: ImageSample, model: Any, processor: Any) -> ModelRunResul
         max_new_tokens=512,
     )
     pred_findings = parse_grounded_report_cxcywh(report_text)
-    eval_summary = evaluate_grounded_report(pred_findings, sample.gt_entry, box_format="cxcywh")
-
-    pred_boxes_cxcywh = [b for f in pred_findings for b in f.get("boxes", [])]
-    vis = draw_xyxy_boxes(sample.cure_image, sample.gt_boxes_xyxy, color="lime", width=3)
-    vis = draw_cxcywh_boxes(vis, pred_boxes_cxcywh, color=MODEL_COLORS["cure"], width=3)
-
     return ModelRunResult(
         model_key="cure",
         report_text=report_text,
         pred_findings=pred_findings,
         box_format="cxcywh",
         latency_s=time.time() - t0,
-        eval_summary=eval_summary,
-        display_image=vis,
     )
 
 
 def load_maira2_model(cfg: DeviceConfig) -> tuple[Any, Any]:
-    from transformers import AutoModelForCausalLM, AutoProcessor, BitsAndBytesConfig
+    """MAIRA-2 (transformers==4.51.3), bf16 full precision."""
+    from transformers import AutoModelForCausalLM, AutoProcessor
 
-    model_kwargs: dict[str, Any] = {
-        "trust_remote_code": True,
-        "low_cpu_mem_usage": True,
-    }
-    if cfg.use_4bit and cfg.device.type == "cuda":
-        model_kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-        )
-        model_kwargs["device_map"] = {"": 0}
-    else:
-        model_kwargs["torch_dtype"] = cfg.dtype
-
-    model = AutoModelForCausalLM.from_pretrained(MAIRA2_ID, **model_kwargs)
+    model = AutoModelForCausalLM.from_pretrained(
+        MAIRA2_ID,
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+    )
     processor = AutoProcessor.from_pretrained(MAIRA2_ID, trust_remote_code=True)
-
-    if not (cfg.use_4bit and cfg.device.type == "cuda"):
-        model = model.to(cfg.device)
+    model = model.to(cfg.device)
     model.eval()
     return model, processor
 
@@ -870,197 +742,88 @@ def infer_maira2(sample: ImageSample, model: Any, processor: Any) -> ModelRunRes
     ).lstrip()
 
     parsed = processor.convert_output_to_plaintext_or_grounded_sequence(raw_prediction)
-    pred_findings = []
-    pred_boxes_xyxy: list[list[float]] = []
+    pred_findings: list[dict[str, Any]] = []
 
     if isinstance(parsed, list):
+        w, h = sample.raw_image.size
         for sentence, boxes in parsed:
             adj_boxes = []
             if boxes:
-                w, h = sample.raw_image.size
                 for box in boxes:
+                    # Returns box normalized [0,1] w.r.t. the ORIGINAL image.
                     adjusted = processor.adjust_box_for_original_image_size(box, w, h)
-                    adj = [float(x) for x in adjusted]
-                    adj_boxes.append(adj)
-                    pred_boxes_xyxy.append(adj)
+                    adj_boxes.append([float(x) for x in adjusted])
             pred_findings.append({"sentence": sentence.strip(), "boxes": adj_boxes})
 
     report_text = findings_to_report_text(pred_findings, box_format="xyxy")
-    eval_summary = evaluate_grounded_report(pred_findings, sample.gt_entry, box_format="xyxy")
-
-    vis = draw_xyxy_boxes(sample.raw_image, sample.gt_boxes_xyxy, color="lime", width=3)
-    vis = draw_xyxy_boxes(vis, pred_boxes_xyxy, color=MODEL_COLORS["maira2"], width=3)
-
     return ModelRunResult(
         model_key="maira2",
         report_text=report_text or raw_prediction,
         pred_findings=pred_findings,
         box_format="xyxy",
         latency_s=time.time() - t0,
-        eval_summary=eval_summary,
-        display_image=vis,
-    )
-
-
-def load_medgemma15_model(cfg: DeviceConfig) -> tuple[Any, Any]:
-    from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
-
-    model_kwargs: dict[str, Any] = {
-        "torch_dtype": cfg.dtype,
-        "low_cpu_mem_usage": True,
-    }
-    if cfg.use_4bit and cfg.device.type == "cuda":
-        model_kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-        )
-        model_kwargs["device_map"] = {"": 0}
-    else:
-        model_kwargs["device_map"] = None
-
-    model = AutoModelForImageTextToText.from_pretrained(MEDGEMMA15_ID, **model_kwargs)
-    processor = AutoProcessor.from_pretrained(MEDGEMMA15_ID)
-
-    if not (cfg.use_4bit and cfg.device.type == "cuda"):
-        model.to(cfg.device)
-    model.eval()
-    return model, processor
-
-
-def infer_medgemma15(sample: ImageSample, model: Any, processor: Any) -> ModelRunResult:
-    t0 = time.time()
-    padded_image, pad_info = pad_image_to_square(sample.raw_image)
-    report_text = run_cure_chat(
-        model,
-        processor,
-        padded_image,
-        MEDGEMMA15_GROUNDED_PROMPT,
-        max_new_tokens=1000,
-    )
-    pred_findings, report_text = parse_medgemma15_json_findings(report_text, pad_info)
-    eval_summary = evaluate_grounded_report(pred_findings, sample.gt_entry, box_format="xyxy")
-
-    pred_boxes_xyxy = [b for f in pred_findings for b in f.get("boxes", [])]
-    vis = draw_xyxy_boxes(sample.raw_image, sample.gt_boxes_xyxy, color="lime", width=3)
-    vis = draw_xyxy_boxes(vis, pred_boxes_xyxy, color=MODEL_COLORS["medgemma15"], width=3)
-
-    return ModelRunResult(
-        model_key="medgemma15",
-        report_text=report_text,
-        pred_findings=pred_findings,
-        box_format="xyxy",
-        latency_s=time.time() - t0,
-        eval_summary=eval_summary,
-        display_image=vis,
     )
 
 
 MODEL_REGISTRY = {
     "cure": (load_cure_model, infer_cure),
     "maira2": (load_maira2_model, infer_maira2),
-    "medgemma15": (load_medgemma15_model, infer_medgemma15),
 }
 
 
 # ---------------------------------------------------------------------------
-# Aggregation + outputs
+# Per-model result serialization (keyword + box payload for the later OpenAI step)
 # ---------------------------------------------------------------------------
 
 
-def aggregate_model_metrics(results_by_model: dict[str, list[ModelRunResult]]) -> list[dict[str, Any]]:
-    summary_rows = []
-    for model_key, runs in results_by_model.items():
-        valid = [r for r in runs if r.eval_summary is not None and r.error is None]
-        if not valid:
-            summary_rows.append({
-                "model": model_key,
-                "n_images": len(runs),
-                "mean_iou_macro": 0.0,
-                "recall@0.3_macro": 0.0,
-                "recall@0.5_macro": 0.0,
-                "avg_latency_s": 0.0,
-                "errors": sum(1 for r in runs if r.error),
-            })
+def build_keyword_findings(
+    pred_findings: list[dict[str, Any]],
+    box_format: str,
+    orig_size: tuple[int, int],
+) -> list[dict[str, Any]]:
+    """Flatten model output into {keyword, box_norm, box_px} entries."""
+    out: list[dict[str, Any]] = []
+    for f in pred_findings:
+        keyword = f.get("sentence", "")
+        boxes = f.get("boxes") or []
+        if not boxes:
+            out.append({"keyword": keyword, "box_norm": None, "box_px": None})
             continue
-
-        summary_rows.append({
-            "model": model_key,
-            "n_images": len(valid),
-            "mean_iou_macro": sum(r.eval_summary["mean_iou"] for r in valid) / len(valid),
-            "recall@0.3_macro": sum(r.eval_summary["recall@0.3"] for r in valid) / len(valid),
-            "recall@0.5_macro": sum(r.eval_summary["recall@0.5"] for r in valid) / len(valid),
-            "avg_latency_s": sum(r.latency_s for r in valid) / len(valid),
-            "errors": sum(1 for r in runs if r.error),
-        })
-    return summary_rows
+        for b in boxes:
+            xyxy = finding_boxes_to_xyxy_norm(b, box_format)
+            out.append({
+                "keyword": keyword,
+                "box_norm": [round(v, 6) for v in xyxy],
+                "box_px": [round(v, 2) for v in norm_xyxy_to_px(xyxy, orig_size)],
+            })
+    return out
 
 
-def save_comparison_figure(
+def make_per_image_payload(
     sample: ImageSample,
-    model_results: dict[str, ModelRunResult],
-    out_path: str,
-) -> None:
-    model_keys = [k for k in MODELS if k in model_results]
-    n = len(model_keys)
-    fig, axes = plt.subplots(1, n, figsize=(5 * n, 5))
-    if n == 1:
-        axes = [axes]
+    result: ModelRunResult,
+    orig_size: tuple[int, int],
+) -> dict[str, Any]:
+    if result.error is not None:
+        return {"error": result.error, "latency_s": result.latency_s}
 
-    for ax, model_key in zip(axes, model_keys):
-        result = model_results[model_key]
-        img = result.display_image if result.display_image is not None else sample.raw_image
-        ax.imshow(img)
-        ax.axis("off")
-        if result.error:
-            title = f"{model_key.upper()}  ERROR"
-        else:
-            ev = result.eval_summary or {}
-            title = (
-                f"{model_key.upper()}  IoU={ev.get('mean_iou', 0.0):.2f}  "
-                f"R@0.3={ev.get('recall@0.3', 0.0):.2f}"
-            )
-        ax.set_title(title, fontsize=10)
-
-    fig.suptitle(f"{sample.image_id}\n(green=GT, colored=predicted)", fontsize=11)
-    plt.tight_layout()
-    fig.savefig(out_path, dpi=130, bbox_inches="tight")
-    plt.close(fig)
-
-
-def print_summary_table(summary_rows: list[dict[str, Any]]) -> None:
-    print("\n================ MODEL COMPARISON SUMMARY ================")
-    header = f"{'model':<12} {'n':>3} {'meanIoU':>8} {'R@0.3':>8} {'R@0.5':>8} {'sec/img':>8} {'err':>4}"
-    print(header)
-    print("-" * len(header))
-    for row in summary_rows:
-        print(
-            f"{row['model']:<12} {row['n_images']:>3} "
-            f"{row['mean_iou_macro']:>8.3f} {row['recall@0.3_macro']:>8.3f} "
-            f"{row['recall@0.5_macro']:>8.3f} {row['avg_latency_s']:>8.1f} "
-            f"{row['errors']:>4}"
-        )
-    print("==========================================================")
-
-
-def serialize_result(result: ModelRunResult) -> dict[str, Any]:
+    det = evaluate_detection(result.pred_findings, sample.gt_entry, result.box_format, orig_size)
+    kw = evaluate_keywords(result.pred_findings, sample.gt_entry)
     return {
-        "model": result.model_key,
         "report_text": result.report_text,
         "box_format": result.box_format,
-        "pred_findings": result.pred_findings,
+        "orig_size": list(orig_size),
+        "keyword_findings": build_keyword_findings(result.pred_findings, result.box_format, orig_size),
+        "detection": det,
+        "keyword": kw,
         "latency_s": result.latency_s,
-        "eval": result.eval_summary,
-        "error": result.error,
+        "error": None,
     }
 
 
 # ---------------------------------------------------------------------------
-# Thesis-grade metrics
+# Aggregation + statistics (report step; no transformers)
 # ---------------------------------------------------------------------------
-
-THESIS_THRESHOLDS = (0.3, 0.5)
 
 
 def _safe_div(num: float, den: float) -> float:
@@ -1071,102 +834,107 @@ def _f1(precision: float, recall: float) -> float:
     return _safe_div(2 * precision * recall, precision + recall)
 
 
-def compute_thesis_metrics(
-    results_by_model: dict[str, list[ModelRunResult]],
-    thresholds: tuple[float, ...] = THESIS_THRESHOLDS,
-) -> dict[str, Any]:
-    """
-    Compute per-model detection metrics for the thesis report:
+def _bootstrap_ci(values: list[float], n: int = 2000, seed: int = 0) -> tuple[float, float, float]:
+    """Return (mean, ci_low, ci_high) via non-parametric bootstrap of the mean."""
+    if not values:
+        return 0.0, 0.0, 0.0
+    arr = np.asarray(values, dtype=float)
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, len(arr), size=(n, len(arr)))
+    boot_means = arr[idx].mean(axis=1)
+    return float(arr.mean()), float(np.percentile(boot_means, 2.5)), float(np.percentile(boot_means, 97.5))
 
-      - Precision / Recall / F1 at each IoU threshold, both micro (pooled boxes)
-        and macro (mean of per-image scores, with std dev).
-      - Mean IoU of matched pairs (micro + macro + std).
-      - Hallucination rate (fraction of predicted boxes with no GT match) at 0.5.
-      - Per-pathology (label) recall@0.5 and mean best IoU.
 
-    Definitions per image at threshold t:
-      TP = predicted boxes matched to a GT box with IoU >= t
-      FP = predicted boxes with no qualifying GT match (hallucinations)
-      FN = GT boxes left unmatched
-    """
-    out: dict[str, Any] = {}
+def _paired_bootstrap(a: list[float], b: list[float], n: int = 2000, seed: int = 0) -> dict[str, float]:
+    """Paired bootstrap on per-image differences (a - b). Two-sided p-value."""
+    if not a or not b or len(a) != len(b):
+        return {"diff": 0.0, "ci_low": 0.0, "ci_high": 0.0, "p_value": 1.0, "n": min(len(a), len(b))}
+    d = np.asarray(a, dtype=float) - np.asarray(b, dtype=float)
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, len(d), size=(n, len(d)))
+    boot = d[idx].mean(axis=1)
+    p = 2.0 * min(float((boot <= 0).mean()), float((boot >= 0).mean()))
+    return {
+        "diff": float(d.mean()),
+        "ci_low": float(np.percentile(boot, 2.5)),
+        "ci_high": float(np.percentile(boot, 97.5)),
+        "p_value": min(p, 1.0),
+        "n": len(d),
+    }
 
-    for model_key, runs in results_by_model.items():
-        valid = [r for r in runs if r.eval_summary is not None and r.error is None]
 
-        model_metrics: dict[str, Any] = {
-            "n_images": len(valid),
-            "n_errors": sum(1 for r in runs if r.error),
-            "thresholds": {},
-        }
+def aggregate_model(per_image: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate one model's per-image payloads into thesis metrics + per-image arrays."""
+    valid_items = [(iid, p) for iid, p in per_image.items() if not p.get("error")]
+    n_errors = sum(1 for p in per_image.values() if p.get("error"))
 
-        # Matched-pair IoU (independent of threshold).
-        per_image_match_iou: list[float] = []
-        all_pair_ious: list[float] = []
-        for r in valid:
-            pair_ious = [
-                row["iou"]
-                for row in r.eval_summary["rows"]
-                if row.get("matched_gt") is not None and row.get("iou") is not None
-            ]
-            all_pair_ious.extend(pair_ious)
-            per_image_match_iou.append(sum(pair_ious) / len(pair_ious) if pair_ious else 0.0)
+    metrics: dict[str, Any] = {
+        "n_images": len(valid_items),
+        "n_errors": n_errors,
+        "thresholds": {},
+        "sweep_f1_micro": {},
+        "per_image": {},  # image_id -> {iou, f1@0.5, kw_f1} for stats/significance
+    }
 
-        model_metrics["mean_iou_micro"] = (
-            sum(all_pair_ious) / len(all_pair_ious) if all_pair_ious else 0.0
-        )
-        model_metrics["mean_iou_macro"] = (
-            statistics.mean(per_image_match_iou) if per_image_match_iou else 0.0
-        )
-        model_metrics["mean_iou_std"] = (
-            statistics.pstdev(per_image_match_iou) if len(per_image_match_iou) > 1 else 0.0
-        )
-        model_metrics["avg_latency_s"] = (
-            statistics.mean([r.latency_s for r in valid]) if valid else 0.0
-        )
-        model_metrics["total_pred_boxes"] = sum(
-            r.eval_summary["n_predicted_with_box"] for r in valid
-        )
-        model_metrics["total_gt_boxes"] = sum(r.eval_summary["n_gt_boxes"] for r in valid)
+    all_pair_ious: list[float] = []
+    per_img_mean_iou: list[float] = []
+    latencies: list[float] = []
+    total_pred = total_gt = 0
 
-        for t in thresholds:
-            tp = fp = fn = 0
-            per_img_p: list[float] = []
-            per_img_r: list[float] = []
-            per_img_f1: list[float] = []
+    for iid, p in valid_items:
+        det = p["detection"]
+        ious = det["matched_ious"]
+        all_pair_ious.extend(ious)
+        img_iou = (sum(ious) / len(ious)) if ious else 0.0
+        per_img_mean_iou.append(img_iou)
+        latencies.append(p.get("latency_s", 0.0))
+        total_pred += det["n_pred_boxes"]
+        total_gt += det["n_gt_boxes"]
+        metrics["per_image"][iid] = {"iou": img_iou}
 
-            for r in valid:
-                ev = r.eval_summary
-                preds_with_box = ev["n_predicted_with_box"]
-                n_gt = ev["n_gt_boxes"]
-                img_tp = sum(
-                    1
-                    for row in ev["rows"]
-                    if row.get("iou") is not None and row["iou"] >= t
-                )
-                img_fp = preds_with_box - img_tp
-                img_fn = n_gt - img_tp
+    metrics["mean_iou_micro"] = (sum(all_pair_ious) / len(all_pair_ious)) if all_pair_ious else 0.0
+    mean_iou, iou_lo, iou_hi = _bootstrap_ci(per_img_mean_iou)
+    metrics["mean_iou_macro"] = mean_iou
+    metrics["mean_iou_std"] = statistics.pstdev(per_img_mean_iou) if len(per_img_mean_iou) > 1 else 0.0
+    metrics["mean_iou_ci"] = [iou_lo, iou_hi]
+    metrics["avg_latency_s"] = statistics.mean(latencies) if latencies else 0.0
+    metrics["total_pred_boxes"] = total_pred
+    metrics["total_gt_boxes"] = total_gt
 
-                tp += img_tp
-                fp += img_fp
-                fn += img_fn
+    # Detection P/R/F1 for every threshold (headline + sweep).
+    for t in ALL_THRESHOLDS:
+        key = _tk(t)
+        tp = fp = fn = 0
+        per_img_p: list[float] = []
+        per_img_r: list[float] = []
+        per_img_f1: list[float] = []
+        for iid, p in valid_items:
+            cell = p["detection"]["per_threshold"][key]
+            i_tp, i_fp, i_fn = cell["tp"], cell["fp"], cell["fn"]
+            tp += i_tp
+            fp += i_fp
+            fn += i_fn
+            p_i = _safe_div(i_tp, i_tp + i_fp)
+            r_i = _safe_div(i_tp, i_tp + i_fn)
+            per_img_p.append(p_i)
+            per_img_r.append(r_i)
+            f1_i = _f1(p_i, r_i)
+            per_img_f1.append(f1_i)
+            if abs(t - 0.5) < 1e-9:
+                metrics["per_image"][iid]["f1@0.5"] = f1_i
 
-                p_i = _safe_div(img_tp, img_tp + img_fp)
-                r_i = _safe_div(img_tp, img_tp + img_fn)
-                per_img_p.append(p_i)
-                per_img_r.append(r_i)
-                per_img_f1.append(_f1(p_i, r_i))
-
-            precision_micro = _safe_div(tp, tp + fp)
-            recall_micro = _safe_div(tp, tp + fn)
-
-            model_metrics["thresholds"][str(t)] = {
+        precision_micro = _safe_div(tp, tp + fp)
+        recall_micro = _safe_div(tp, tp + fn)
+        f1_micro = _f1(precision_micro, recall_micro)
+        metrics["sweep_f1_micro"][key] = f1_micro
+        if t in HEADLINE_THRESHOLDS:
+            metrics["thresholds"][key] = {
                 "tp": tp,
                 "fp": fp,
                 "fn": fn,
                 "precision_micro": precision_micro,
                 "recall_micro": recall_micro,
-                "f1_micro": _f1(precision_micro, recall_micro),
+                "f1_micro": f1_micro,
                 "precision_macro": statistics.mean(per_img_p) if per_img_p else 0.0,
                 "recall_macro": statistics.mean(per_img_r) if per_img_r else 0.0,
                 "f1_macro": statistics.mean(per_img_f1) if per_img_f1 else 0.0,
@@ -1174,79 +942,84 @@ def compute_thesis_metrics(
                 "hallucination_rate": 1.0 - precision_micro,
             }
 
-        # Per-pathology (label) breakdown, pooled across images.
-        label_stats: dict[str, dict[str, Any]] = {}
-        for r in valid:
-            for g in r.eval_summary.get("gt_detail", []):
-                for label in g.get("labels", []) or []:
-                    ls = label_stats.setdefault(
-                        label, {"n_gt": 0, "matched_05": 0, "iou_sum": 0.0}
-                    )
-                    ls["n_gt"] += 1
-                    ls["iou_sum"] += g.get("best_iou", 0.0)
-                    if g.get("best_iou", 0.0) >= 0.5:
-                        ls["matched_05"] += 1
+    # Score-free mAP-like surrogate = mean micro F1 across the 0.50:0.05:0.95 sweep.
+    sweep_vals = [metrics["sweep_f1_micro"][_tk(t)] for t in SWEEP_THRESHOLDS]
+    metrics["map_like_50_95"] = statistics.mean(sweep_vals) if sweep_vals else 0.0
+    metrics["ap50_f1"] = metrics["sweep_f1_micro"].get(_tk(0.5), 0.0)
 
-        per_label = []
-        for label, ls in sorted(label_stats.items(), key=lambda kv: -kv[1]["n_gt"]):
-            per_label.append({
-                "label": label,
-                "n_gt": ls["n_gt"],
-                "recall@0.5": _safe_div(ls["matched_05"], ls["n_gt"]),
-                "mean_best_iou": _safe_div(ls["iou_sum"], ls["n_gt"]),
-            })
-        model_metrics["per_label"] = per_label
-
-        out[model_key] = model_metrics
-
-    return out
-
-
-def collect_run_metadata(cfg: DeviceConfig) -> dict[str, Any]:
-    import transformers
-
-    try:
-        import peft
-
-        peft_version = peft.__version__
-    except Exception:
-        peft_version = "n/a"
-
-    meta: dict[str, Any] = {
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "device": str(cfg.device),
-        "dtype": str(cfg.dtype),
-        "use_4bit": cfg.use_4bit,
-        "n_images": N_IMAGES,
-        "shuffle_seed": SHUFFLE_SEED,
-        "models": MODELS,
-        "python": platform.python_version(),
-        "platform": platform.platform(),
-        "torch": torch.__version__,
-        "transformers": transformers.__version__,
-        "peft": peft_version,
+    # Keyword-vs-label match.
+    ktp = kfp = kfn = 0
+    kw_p: list[float] = []
+    kw_r: list[float] = []
+    kw_f1: list[float] = []
+    for iid, p in valid_items:
+        kw = p["keyword"]
+        ktp += kw["tp"]
+        kfp += kw["fp"]
+        kfn += kw["fn"]
+        p_i = _safe_div(kw["tp"], kw["tp"] + kw["fp"])
+        r_i = _safe_div(kw["tp"], kw["tp"] + kw["fn"])
+        kw_p.append(p_i)
+        kw_r.append(r_i)
+        f1_i = _f1(p_i, r_i)
+        kw_f1.append(f1_i)
+        metrics["per_image"][iid]["kw_f1"] = f1_i
+    kw_prec_micro = _safe_div(ktp, ktp + kfp)
+    kw_rec_micro = _safe_div(ktp, ktp + kfn)
+    kw_f1_mean, kw_f1_lo, kw_f1_hi = _bootstrap_ci(kw_f1)
+    metrics["keyword"] = {
+        "tp": ktp,
+        "fp": kfp,
+        "fn": kfn,
+        "precision_micro": kw_prec_micro,
+        "recall_micro": kw_rec_micro,
+        "f1_micro": _f1(kw_prec_micro, kw_rec_micro),
+        "precision_macro": statistics.mean(kw_p) if kw_p else 0.0,
+        "recall_macro": statistics.mean(kw_r) if kw_r else 0.0,
+        "f1_macro": kw_f1_mean,
+        "f1_macro_std": statistics.pstdev(kw_f1) if len(kw_f1) > 1 else 0.0,
+        "f1_ci": [kw_f1_lo, kw_f1_hi],
     }
 
-    if cfg.device.type == "cuda" and torch.cuda.is_available():
-        try:
-            meta["gpu_name"] = torch.cuda.get_device_name(0)
-            meta["gpu_vram_gb"] = round(
-                torch.cuda.get_device_properties(0).total_memory / 1e9, 1
-            )
-        except Exception:
-            pass
+    # Per-pathology (label) breakdown.
+    label_stats: dict[str, dict[str, Any]] = {}
+    for iid, p in valid_items:
+        for g in p["detection"].get("gt_detail", []):
+            for label in g.get("labels", []) or []:
+                ls = label_stats.setdefault(label, {"n_gt": 0, "matched_05": 0, "iou_sum": 0.0})
+                ls["n_gt"] += 1
+                ls["iou_sum"] += g.get("best_iou", 0.0)
+                if g.get("best_iou", 0.0) >= 0.5:
+                    ls["matched_05"] += 1
+    per_label = []
+    for label, ls in sorted(label_stats.items(), key=lambda kv: -kv[1]["n_gt"]):
+        per_label.append({
+            "label": label,
+            "n_gt": ls["n_gt"],
+            "recall@0.5": _safe_div(ls["matched_05"], ls["n_gt"]),
+            "mean_best_iou": _safe_div(ls["iou_sum"], ls["n_gt"]),
+        })
+    metrics["per_label"] = per_label
 
-    try:
-        commit = subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=BASE_DIR,
-            stderr=subprocess.DEVNULL,
-        )
-        meta["git_commit"] = commit.decode().strip()
-    except Exception:
-        meta["git_commit"] = "n/a"
+    return metrics
 
-    return meta
+
+def compute_significance(thesis_metrics: dict[str, Any]) -> dict[str, Any]:
+    """Paired bootstrap CURE vs MAIRA-2 on per-image IoU, F1@0.5, keyword F1."""
+    if "cure" not in thesis_metrics or "maira2" not in thesis_metrics:
+        return {}
+    cure_pi = thesis_metrics["cure"].get("per_image", {})
+    maira_pi = thesis_metrics["maira2"].get("per_image", {})
+    common = sorted(set(cure_pi) & set(maira_pi))
+    if not common:
+        return {}
+
+    out: dict[str, Any] = {"n_paired_images": len(common)}
+    for metric_key in ("iou", "f1@0.5", "kw_f1"):
+        a = [cure_pi[i].get(metric_key, 0.0) for i in common]
+        b = [maira_pi[i].get(metric_key, 0.0) for i in common]
+        out[metric_key] = _paired_bootstrap(a, b)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1285,37 +1058,32 @@ def _bar_plot(
     plt.close(fig)
 
 
-def generate_plots(
-    thesis_metrics: dict[str, Any],
-    plots_dir: str,
-) -> list[str]:
+def generate_plots(thesis_metrics: dict[str, Any], plots_dir: str) -> list[str]:
     os.makedirs(plots_dir, exist_ok=True)
-    model_keys = [k for k in MODELS if k in thesis_metrics and thesis_metrics[k]["n_images"] > 0]
+    model_keys = [k for k in ALL_MODELS if k in thesis_metrics and thesis_metrics[k]["n_images"] > 0]
     if not model_keys:
         return []
 
     paths: list[str] = []
 
-    # 1. Mean IoU (macro) with std error bars.
     iou_path = os.path.join(plots_dir, "mean_iou.png")
     _bar_plot(
         model_keys,
         {"mean IoU (macro)": [thesis_metrics[k]["mean_iou_macro"] for k in model_keys]},
-        "Mean IoU of matched boxes (macro avg +/- std)",
+        "Mean IoU of matched boxes (macro avg +/- std, pixel space)",
         "IoU",
         iou_path,
         errors={"mean IoU (macro)": [thesis_metrics[k]["mean_iou_std"] for k in model_keys]},
     )
     paths.append(iou_path)
 
-    # 2. Precision / Recall / F1 at IoU 0.5 (micro).
     prf_path = os.path.join(plots_dir, "precision_recall_f1_at_0.5.png")
     _bar_plot(
         model_keys,
         {
-            "precision": [thesis_metrics[k]["thresholds"]["0.5"]["precision_micro"] for k in model_keys],
-            "recall": [thesis_metrics[k]["thresholds"]["0.5"]["recall_micro"] for k in model_keys],
-            "F1": [thesis_metrics[k]["thresholds"]["0.5"]["f1_micro"] for k in model_keys],
+            "precision": [thesis_metrics[k]["thresholds"]["0.50"]["precision_micro"] for k in model_keys],
+            "recall": [thesis_metrics[k]["thresholds"]["0.50"]["recall_micro"] for k in model_keys],
+            "F1": [thesis_metrics[k]["thresholds"]["0.50"]["f1_micro"] for k in model_keys],
         },
         "Detection performance @ IoU>=0.5 (micro)",
         "score",
@@ -1323,13 +1091,12 @@ def generate_plots(
     )
     paths.append(prf_path)
 
-    # 3. Recall at 0.3 vs 0.5 (micro).
     rec_path = os.path.join(plots_dir, "recall_at_thresholds.png")
     _bar_plot(
         model_keys,
         {
-            "recall@0.3": [thesis_metrics[k]["thresholds"]["0.3"]["recall_micro"] for k in model_keys],
-            "recall@0.5": [thesis_metrics[k]["thresholds"]["0.5"]["recall_micro"] for k in model_keys],
+            "recall@0.3": [thesis_metrics[k]["thresholds"]["0.30"]["recall_micro"] for k in model_keys],
+            "recall@0.5": [thesis_metrics[k]["thresholds"]["0.50"]["recall_micro"] for k in model_keys],
         },
         "Recall at IoU thresholds (micro)",
         "recall",
@@ -1337,23 +1104,38 @@ def generate_plots(
     )
     paths.append(rec_path)
 
-    # 4. Hallucination rate @ 0.5.
-    hall_path = os.path.join(plots_dir, "hallucination_rate.png")
+    map_path = os.path.join(plots_dir, "map_like_and_hallucination.png")
     _bar_plot(
         model_keys,
-        {"hallucination rate": [thesis_metrics[k]["thresholds"]["0.5"]["hallucination_rate"] for k in model_keys]},
-        "Hallucination rate (1 - precision @ IoU>=0.5)",
-        "rate",
-        hall_path,
+        {
+            "mAP-like@[.5:.95]": [thesis_metrics[k]["map_like_50_95"] for k in model_keys],
+            "hallucination@0.5": [thesis_metrics[k]["thresholds"]["0.50"]["hallucination_rate"] for k in model_keys],
+        },
+        "mAP-like surrogate (mean F1 over IoU 0.5:0.95) and hallucination rate",
+        "score",
+        map_path,
     )
-    paths.append(hall_path)
+    paths.append(map_path)
 
-    # 5. Average latency per image.
+    kw_path = os.path.join(plots_dir, "keyword_f1.png")
+    _bar_plot(
+        model_keys,
+        {
+            "keyword precision": [thesis_metrics[k]["keyword"]["precision_micro"] for k in model_keys],
+            "keyword recall": [thesis_metrics[k]["keyword"]["recall_micro"] for k in model_keys],
+            "keyword F1": [thesis_metrics[k]["keyword"]["f1_micro"] for k in model_keys],
+        },
+        "Keyword vs GT-label match (micro)",
+        "score",
+        kw_path,
+    )
+    paths.append(kw_path)
+
     lat_path = os.path.join(plots_dir, "latency.png")
     _bar_plot(
         model_keys,
         {"sec/image": [thesis_metrics[k]["avg_latency_s"] for k in model_keys]},
-        "Average inference latency per image",
+        "Average inference latency per image (bf16)",
         "seconds",
         lat_path,
     )
@@ -1375,35 +1157,36 @@ def write_markdown_report(
     report_path: str,
     metadata: dict[str, Any],
     thesis_metrics: dict[str, Any],
-    samples: list[ImageSample],
-    all_results: dict[str, dict[str, ModelRunResult]],
+    significance: dict[str, Any],
     plot_paths: list[str],
     output_dir: str,
 ) -> None:
-    model_keys = [k for k in MODELS if k in thesis_metrics]
+    model_keys = [k for k in ALL_MODELS if k in thesis_metrics]
     lines: list[str] = []
 
     def rel(path: str) -> str:
         return os.path.relpath(path, output_dir)
 
-    lines.append("# CXR Grounded Report Model Comparison")
+    lines.append("# CXR Grounded Finding Localization: CURE vs MAIRA-2")
     lines.append("")
     lines.append(
-        "Comparison of **CURE**, **MAIRA-2**, and **MedGemma 1.5** on PadChest-GR "
-        "grounded report generation. Predicted bounding boxes are matched to "
-        "ground-truth boxes by IoU (greedy, one-to-one)."
+        "Comparison of **CURE** and **MAIRA-2** on PadChest-GR. Each model outputs "
+        "short keyword findings + bounding boxes (the narrative report is future work, "
+        "assembled by OpenAI from these `{keyword, box}` findings). Boxes are matched to "
+        "ground truth by IoU in **original-image pixel coordinates** (greedy, one-to-one, "
+        "over all predicted boxes). Both models run in **bf16 full precision (no 4-bit)**."
     )
     lines.append("")
 
-    # Environment / reproducibility.
     lines.append("## 1. Run metadata (reproducibility)")
     lines.append("")
     lines.append("| Field | Value |")
     lines.append("|---|---|")
     for key in [
-        "timestamp_utc", "git_commit", "device", "gpu_name", "gpu_vram_gb",
-        "dtype", "use_4bit", "n_images", "shuffle_seed", "models",
-        "python", "platform", "torch", "transformers", "peft",
+        "timestamp_utc", "git_commit", "device", "dtype",
+        "n_images", "shuffle_seed", "models",
+        "python", "platform", "torch",
+        "maira2_transformers", "cure_transformers", "cure_peft",
     ]:
         if key in metadata:
             val = metadata[key]
@@ -1412,31 +1195,33 @@ def write_markdown_report(
             lines.append(f"| `{key}` | {val} |")
     lines.append("")
 
-    # Main results table.
-    lines.append("## 2. Headline detection metrics")
+    lines.append("## 2. Headline metrics")
     lines.append("")
     lines.append(
-        "Micro = pooled over all boxes; Macro = mean over per-image scores. "
-        "Mean IoU is over matched pairs only."
+        "IoU in pixel space; micro = pooled over boxes, macro = mean over per-image "
+        "scores (+/- std). `mAP-like@[.5:.95]` is the mean micro-F1 over IoU 0.50:0.05:0.95 "
+        "(a **score-free surrogate** for COCO mAP - these generative models emit no box "
+        "confidences, so true AP is undefined). Keyword F1 matches predicted finding "
+        "keywords to GT labels (difflib)."
     )
     lines.append("")
     header = (
-        "| Model | N | mean IoU (macro±std) | P@0.5 | R@0.5 | F1@0.5 | "
-        "R@0.3 | Halluc.@0.5 | sec/img | errors |"
+        "| Model | N | mean IoU (macro±std) | P@0.5 | R@0.5 | F1@0.5 | R@0.3 | "
+        "mAP-like | Halluc.@0.5 | keyword F1 | sec/img | errors |"
     )
     lines.append(header)
-    lines.append("|" + "---|" * 10)
+    lines.append("|" + "---|" * 12)
     for k in model_keys:
         m = thesis_metrics[k]
-        t5 = m["thresholds"].get("0.5", {})
-        t3 = m["thresholds"].get("0.3", {})
+        t5 = m["thresholds"].get("0.50", {})
+        t3 = m["thresholds"].get("0.30", {})
         lines.append(
             f"| **{k.upper()}** | {m['n_images']} | "
             f"{_fmt(m['mean_iou_macro'])} ± {_fmt(m['mean_iou_std'])} | "
             f"{_fmt(t5.get('precision_micro', 0))} | {_fmt(t5.get('recall_micro', 0))} | "
             f"{_fmt(t5.get('f1_micro', 0))} | {_fmt(t3.get('recall_micro', 0))} | "
-            f"{_fmt(t5.get('hallucination_rate', 0))} | {_fmt(m['avg_latency_s'], 1)} | "
-            f"{m['n_errors']} |"
+            f"{_fmt(m['map_like_50_95'])} | {_fmt(t5.get('hallucination_rate', 0))} | "
+            f"{_fmt(m['keyword']['f1_micro'])} | {_fmt(m['avg_latency_s'], 1)} | {m['n_errors']} |"
         )
     lines.append("")
     lines.append(
@@ -1449,18 +1234,16 @@ def write_markdown_report(
     )
     lines.append("")
 
-    # Micro/macro detail per threshold.
     lines.append("## 3. Precision / Recall / F1 (micro and macro)")
     lines.append("")
-    for t in THESIS_THRESHOLDS:
+    for t in HEADLINE_THRESHOLDS:
+        key = _tk(t)
         lines.append(f"### IoU threshold {t}")
         lines.append("")
-        lines.append(
-            "| Model | P micro | R micro | F1 micro | P macro | R macro | F1 macro | TP | FP | FN |"
-        )
+        lines.append("| Model | P micro | R micro | F1 micro | P macro | R macro | F1 macro | TP | FP | FN |")
         lines.append("|" + "---|" * 10)
         for k in model_keys:
-            td = thesis_metrics[k]["thresholds"].get(str(t), {})
+            td = thesis_metrics[k]["thresholds"].get(key, {})
             lines.append(
                 f"| {k.upper()} | {_fmt(td.get('precision_micro', 0))} | "
                 f"{_fmt(td.get('recall_micro', 0))} | {_fmt(td.get('f1_micro', 0))} | "
@@ -1470,9 +1253,46 @@ def write_markdown_report(
             )
         lines.append("")
 
-    # Plots.
+    lines.append("## 4. Confidence intervals (95% bootstrap, macro per image)")
+    lines.append("")
+    lines.append("| Model | mean IoU [95% CI] | keyword F1 [95% CI] |")
+    lines.append("|---|---|---|")
+    for k in model_keys:
+        m = thesis_metrics[k]
+        iou_ci = m.get("mean_iou_ci", [0, 0])
+        kw_ci = m["keyword"].get("f1_ci", [0, 0])
+        lines.append(
+            f"| {k.upper()} | {_fmt(m['mean_iou_macro'])} "
+            f"[{_fmt(iou_ci[0])}, {_fmt(iou_ci[1])}] | "
+            f"{_fmt(m['keyword']['f1_macro'])} [{_fmt(kw_ci[0])}, {_fmt(kw_ci[1])}] |"
+        )
+    lines.append("")
+
+    if significance:
+        lines.append("## 5. Significance: CURE vs MAIRA-2 (paired bootstrap)")
+        lines.append("")
+        lines.append(
+            f"Paired over {significance.get('n_paired_images', 0)} images. "
+            "diff = CURE - MAIRA-2 (positive favours CURE). Significant at 95% if the CI excludes 0."
+        )
+        lines.append("")
+        lines.append("| Metric | diff (CURE-MAIRA) | 95% CI | p-value | significant |")
+        lines.append("|---|---|---|---|---|")
+        label_map = {"iou": "mean IoU", "f1@0.5": "F1@0.5", "kw_f1": "keyword F1"}
+        for mk, label in label_map.items():
+            s = significance.get(mk)
+            if not s:
+                continue
+            sig = "yes" if (s["ci_low"] > 0 or s["ci_high"] < 0) else "no"
+            lines.append(
+                f"| {label} | {_fmt(s['diff'])} | "
+                f"[{_fmt(s['ci_low'])}, {_fmt(s['ci_high'])}] | "
+                f"{_fmt(s['p_value'])} | {sig} |"
+            )
+        lines.append("")
+
     if plot_paths:
-        lines.append("## 4. Plots")
+        lines.append("## 6. Plots")
         lines.append("")
         for p in plot_paths:
             name = os.path.splitext(os.path.basename(p))[0].replace("_", " ")
@@ -1481,8 +1301,7 @@ def write_markdown_report(
             lines.append(f"![{name}]({rel(p)})")
             lines.append("")
 
-    # Per-pathology breakdown.
-    lines.append("## 5. Per-pathology breakdown (recall@0.5 / mean best IoU)")
+    lines.append("## 7. Per-pathology breakdown (recall@0.5 / mean best IoU)")
     lines.append("")
     for k in model_keys:
         per_label = thesis_metrics[k].get("per_label", [])
@@ -1499,61 +1318,25 @@ def write_markdown_report(
             )
         lines.append("")
 
-    # Per-image appendix.
-    lines.append("## 6. Per-image appendix")
-    lines.append("")
-    for sample in samples:
-        lines.append(f"### {sample.image_id}")
-        lines.append("")
-        fig_path = os.path.join(
-            output_dir, "per_image", f"compare_{os.path.splitext(sample.image_id)[0]}.png"
-        )
-        if os.path.exists(fig_path):
-            lines.append(f"![{sample.image_id}]({rel(fig_path)})")
-            lines.append("")
-        lines.append("**Ground-truth findings:**")
-        lines.append("")
-        for s in sample.gt_sentences:
-            lines.append(f"- {s}")
-        lines.append("")
-        for k in model_keys:
-            result = all_results.get(sample.image_id, {}).get(k)
-            if result is None:
-                continue
-            lines.append(f"**{k.upper()}**", )
-            if result.error:
-                lines.append("")
-                lines.append(f"> ERROR: {result.error}")
-                lines.append("")
-                continue
-            ev = result.eval_summary or {}
-            lines.append(
-                f" — mean IoU {_fmt(ev.get('mean_iou', 0))}, "
-                f"R@0.3 {_fmt(ev.get('recall@0.3', 0), 2)}, "
-                f"R@0.5 {_fmt(ev.get('recall@0.5', 0), 2)}, "
-                f"{_fmt(result.latency_s, 1)}s"
-            )
-            lines.append("")
-            lines.append("```")
-            lines.append(result.report_text.strip() or "(empty output)")
-            lines.append("```")
-            lines.append("")
-
-    # Caveats.
-    lines.append("## 7. Caveats")
+    lines.append("## 8. Caveats")
     lines.append("")
     lines.append(
-        "- CURE boxes are normalized to its 448x448 CLAHE input, while MAIRA-2 and "
-        "MedGemma 1.5 use original-image coordinates, so cross-model IoU is an "
-        "approximate comparison rather than an exact benchmark."
+        "- IoU is computed in original-image pixel coordinates for every model "
+        "(CURE cxcywh, MAIRA-2 xyxy and GT are all mapped to original W x H px first), "
+        "so aspect ratio is honoured identically."
     )
     lines.append(
-        "- MedGemma 1.5's grounded-box output format is not standardized; box "
-        "parsing is best-effort and may undercount its predictions."
+        "- `mAP-like@[.5:.95]` is a score-free surrogate (mean micro-F1 across IoU "
+        "thresholds); the generative models produce no per-box confidence, so a true "
+        "COCO AP / PR curve is not defined."
     )
     lines.append(
-        "- Matching is greedy one-to-one by IoU; a predicted box can match at most "
-        "one GT box."
+        "- Keyword matching is lexical (difflib ratio >= 0.8 or substring); it is a "
+        "sanity signal for 'did the model name the right finding', not a clinical NLG metric."
+    )
+    lines.append(
+        "- Both models run in bf16 full precision; numbers therefore differ from any "
+        "published 4-bit results."
     )
     lines.append("")
 
@@ -1562,7 +1345,7 @@ def write_markdown_report(
 
 
 # ---------------------------------------------------------------------------
-# Logging (tee stdout+stderr to run.log)
+# Logging (tee stdout+stderr to a log file)
 # ---------------------------------------------------------------------------
 
 
@@ -1591,170 +1374,245 @@ class _Tee:
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Subcommands
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
+def cmd_select(_: argparse.Namespace) -> None:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    per_image_dir = os.path.join(OUTPUT_DIR, "per_image")
-    os.makedirs(per_image_dir, exist_ok=True)
 
-    tee = _Tee(os.path.join(OUTPUT_DIR, "run.log"))
-    sys.stdout = tee
-    sys.stderr = tee
+    if os.path.exists(IMAGE_LIST_PATH) and os.environ.get("FORCE_RESELECT", "0") != "1":
+        with open(IMAGE_LIST_PATH, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        print(f"image_list.json already exists ({len(state.get('selected', []))} images).")
+        print("Reusing it so both models score the same set. Set FORCE_RESELECT=1 to re-pick.")
+        return
 
-    print(f"Run started (UTC): {datetime.now(timezone.utc).isoformat(timespec='seconds')}")
-
-    setup_hf_auth()
-    cfg = resolve_device_config()
-
-    print("\nChecking paths...")
-    print("JSON exists:", os.path.exists(JSON_PATH))
-    print("Images dir exists:", os.path.exists(IMAGES_DIR))
     if not os.path.exists(JSON_PATH) or not os.path.exists(IMAGES_DIR):
-        raise FileNotFoundError("Missing Padchest-GR JSON or images directory.")
+        raise FileNotFoundError(f"Missing GT json ({JSON_PATH}) or images dir ({IMAGES_DIR}).")
 
     gt_by_id = load_gt_index(JSON_PATH)
     prefer = DEFAULT_VERIFY_IMAGE if N_IMAGES == 1 else None
-    selected_ids = select_images(
-        IMAGES_DIR,
-        gt_by_id,
-        N_IMAGES,
-        SHUFFLE_SEED,
-        prefer_image=prefer,
-    )
-    samples = build_samples(selected_ids, gt_by_id)
+    selected = select_images(IMAGES_DIR, gt_by_id, N_IMAGES, SHUFFLE_SEED, prefer_image=prefer)
 
-    print(f"\nSelected {len(samples)} image(s):")
-    for i, sample in enumerate(samples, start=1):
-        print(
-            f"  {i:>2}. {sample.image_id}  "
-            f"(gt_boxes={len(sample.gt_boxes_xyxy)}, gt_findings={len(sample.gt_sentences)})"
-        )
-
-    print(f"\nModels to run (sequential): {', '.join(MODELS)}")
-
-    all_results: dict[str, dict[str, ModelRunResult]] = {
-        sample.image_id: {} for sample in samples
+    state = {
+        "seed": SHUFFLE_SEED,
+        "n_images": N_IMAGES,
+        "n_selected": len(selected),
+        "selected": selected,
+        "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
-    results_by_model: dict[str, list[ModelRunResult]] = {k: [] for k in MODELS}
+    with open(IMAGE_LIST_PATH, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, ensure_ascii=False)
+    print(f"Selected {len(selected)} image(s) (seed={SHUFFLE_SEED}) -> {IMAGE_LIST_PATH}")
+    for i, iid in enumerate(selected[:10], start=1):
+        print(f"  {i:>2}. {iid}")
+    if len(selected) > 10:
+        print(f"  ... (+{len(selected) - 10} more)")
 
-    for model_key in MODELS:
-        if model_key not in MODEL_REGISTRY:
-            print(f"[WARN] Unknown model '{model_key}', skipping.")
-            continue
+
+def _load_image_list() -> list[str]:
+    if not os.path.exists(IMAGE_LIST_PATH):
+        raise FileNotFoundError(
+            f"{IMAGE_LIST_PATH} not found. Run `python compare_models.py select` first."
+        )
+    with open(IMAGE_LIST_PATH, "r", encoding="utf-8") as f:
+        state = json.load(f)
+    selected = state.get("selected") or []
+    if not selected:
+        raise RuntimeError("image_list.json has no 'selected' images.")
+    return selected
+
+
+def cmd_run(args: argparse.Namespace) -> None:
+    model_key = args.model
+    if model_key not in MODEL_REGISTRY:
+        raise SystemExit(f"Unknown model '{model_key}'. Choose from: {list(MODEL_REGISTRY)}")
+
+    os.makedirs(PER_MODEL_DIR, exist_ok=True)
+    tee = _Tee(os.path.join(OUTPUT_DIR, f"run_{model_key}.log"))
+    sys.stdout = tee
+    sys.stderr = tee
+
+    try:
+        print(f"Run [{model_key}] started (UTC): "
+              f"{datetime.now(timezone.utc).isoformat(timespec='seconds')}")
+        setup_hf_auth()
+        cfg = resolve_device_config()
+
+        selected = _load_image_list()
+        gt_by_id = load_gt_index(JSON_PATH)
+        print(f"Scoring {len(selected)} images for {model_key.upper()}.")
+
+        import transformers  # noqa: F401  (record version)
 
         loader, infer_fn = MODEL_REGISTRY[model_key]
-        print(f"\n{'=' * 60}\nLoading {model_key.upper()}...\n{'=' * 60}")
-        try:
-            model, processor = loader(cfg)
-        except Exception as exc:
-            print(f"[ERROR] Failed to load {model_key}: {exc}")
-            for sample in samples:
-                err_result = ModelRunResult(
-                    model_key=model_key,
-                    report_text="",
-                    pred_findings=[],
-                    box_format="xyxy",
-                    latency_s=0.0,
-                    error=str(exc),
-                )
-                all_results[sample.image_id][model_key] = err_result
-                results_by_model[model_key].append(err_result)
-            continue
+        print(f"Loading {model_key.upper()} (bf16)...")
+        model, processor = loader(cfg)
 
-        for idx, sample in enumerate(samples, start=1):
-            print(f"[{model_key}] {idx}/{len(samples)}  {sample.image_id}")
+        per_image: dict[str, dict[str, Any]] = {}
+        save_figures = os.environ.get("SAVE_FIGURES", "0") == "1"
+        fig_dir = os.path.join(OUTPUT_DIR, "per_image")
+        if save_figures:
+            os.makedirs(fig_dir, exist_ok=True)
+
+        for idx, image_id in enumerate(selected, start=1):
             try:
+                sample = build_sample(image_id, gt_by_id, which=model_key)
                 result = infer_fn(sample, model, processor)
-                all_results[sample.image_id][model_key] = result
-                results_by_model[model_key].append(result)
-                ev = result.eval_summary or {}
+                payload = make_per_image_payload(sample, result, sample.orig_size)
+                per_image[image_id] = payload
+
+                det = payload.get("detection", {})
                 print(
-                    f"  IoU={ev.get('mean_iou', 0.0):.3f}  "
-                    f"R@0.3={ev.get('recall@0.3', 0.0):.2f}  "
-                    f"R@0.5={ev.get('recall@0.5', 0.0):.2f}  "
-                    f"({result.latency_s:.1f}s)"
+                    f"[{model_key}] {idx}/{len(selected)} {image_id}  "
+                    f"IoU={det.get('mean_iou', 0.0):.3f} "
+                    f"R@0.5={det.get('recall@0.5', 0.0):.2f} "
+                    f"pred={det.get('n_pred_boxes', 0)} gt={det.get('n_gt_boxes', 0)} "
+                    f"({payload.get('latency_s', 0.0):.1f}s)"
                 )
-            except Exception as exc:
-                print(f"  [ERROR] {exc}")
-                err_result = ModelRunResult(
-                    model_key=model_key,
-                    report_text="",
-                    pred_findings=[],
-                    box_format="xyxy",
-                    latency_s=0.0,
-                    error=str(exc),
-                )
-                all_results[sample.image_id][model_key] = err_result
-                results_by_model[model_key].append(err_result)
+
+                if save_figures:
+                    _save_preview(sample, result, model_key, os.path.join(
+                        fig_dir, f"{model_key}_{os.path.splitext(image_id)[0]}.png"))
+            except Exception as exc:  # noqa: BLE001
+                print(f"[{model_key}] {idx}/{len(selected)} {image_id}  [ERROR] {exc}")
+                per_image[image_id] = {"error": str(exc), "latency_s": 0.0}
 
         free_model(model, processor)
 
-    summary_rows = aggregate_model_metrics(results_by_model)
-    print_summary_table(summary_rows)
-
-    thesis_metrics = compute_thesis_metrics(results_by_model)
-    metadata = collect_run_metadata(cfg)
-
-    json_payload = {
-        "config": {
-            "n_images": N_IMAGES,
-            "shuffle_seed": SHUFFLE_SEED,
-            "models": MODELS,
-            "device": str(cfg.device),
-            "use_4bit": cfg.use_4bit,
-        },
-        "metadata": metadata,
-        "thesis_metrics": thesis_metrics,
-        "images": [],
-        "summary": summary_rows,
-    }
-
-    for sample in samples:
-        image_entry = {
-            "image_id": sample.image_id,
-            "image_path": sample.image_path,
-            "gt_sentences": sample.gt_sentences,
-            "gt_boxes_xyxy": sample.gt_boxes_xyxy,
-            "models": {},
+        out = {
+            "model": model_key,
+            "transformers": transformers.__version__,
+            "n_images": len(per_image),
+            "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "per_image": per_image,
         }
-        fig_path = os.path.join(
-            per_image_dir,
-            f"compare_{os.path.splitext(sample.image_id)[0]}.png",
+        out_path = os.path.join(PER_MODEL_DIR, f"{model_key}.json")
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(out, f, indent=2, ensure_ascii=False)
+        print(f"Saved {out_path}")
+    finally:
+        tee.close()
+
+
+def _save_preview(sample: ImageSample, result: ModelRunResult, model_key: str, out_path: str) -> None:
+    base = sample.cure_image if model_key == "cure" else sample.raw_image
+    if base is None:
+        return
+    vis = draw_xyxy_boxes(base, sample.gt_boxes_xyxy, color="lime", width=3)
+    pred_boxes = [b for f in result.pred_findings for b in (f.get("boxes") or [])]
+    if result.box_format == "cxcywh":
+        vis = draw_cxcywh_boxes(vis, pred_boxes, color=MODEL_COLORS[model_key], width=3)
+    else:
+        vis = draw_xyxy_boxes(vis, pred_boxes, color=MODEL_COLORS[model_key], width=3)
+    fig, ax = plt.subplots(figsize=(5, 5))
+    ax.imshow(vis)
+    ax.axis("off")
+    ax.set_title(f"{model_key.upper()} ({sample.image_id})", fontsize=9)
+    fig.savefig(out_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _collect_report_metadata() -> dict[str, Any]:
+    meta: dict[str, Any] = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "device": os.environ.get("DEVICE", "cpu"),
+        "dtype": "bfloat16",
+        "n_images": N_IMAGES,
+        "shuffle_seed": SHUFFLE_SEED,
+        "models": [k for k in ALL_MODELS],
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "torch": torch.__version__,
+    }
+    # Pull each model's recorded transformers version from its per-model JSON.
+    for mk in ALL_MODELS:
+        p = os.path.join(PER_MODEL_DIR, f"{mk}.json")
+        if os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    meta[f"{mk}_transformers"] = json.load(f).get("transformers", "n/a")
+            except Exception:
+                pass
+    meta["cure_peft"] = "0.17.1 (pinned)"
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"], cwd=BASE_DIR, stderr=subprocess.DEVNULL
         )
-        save_comparison_figure(sample, all_results[sample.image_id], fig_path)
-        image_entry["comparison_figure"] = fig_path
+        meta["git_commit"] = commit.decode().strip()
+    except Exception:
+        meta["git_commit"] = "n/a"
+    return meta
 
-        for model_key, result in all_results[sample.image_id].items():
-            image_entry["models"][model_key] = serialize_result(result)
 
-        json_payload["images"].append(image_entry)
-        print(f"Saved figure: {fig_path}")
+def cmd_report(_: argparse.Namespace) -> None:
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+    loaded: dict[str, dict[str, Any]] = {}
+    for mk in ALL_MODELS:
+        p = os.path.join(PER_MODEL_DIR, f"{mk}.json")
+        if os.path.exists(p):
+            with open(p, "r", encoding="utf-8") as f:
+                loaded[mk] = json.load(f)
+        else:
+            print(f"[WARN] Missing {p} - {mk} will be absent from the report.")
+
+    if not loaded:
+        raise SystemExit("No per-model results found. Run `run --model ...` first.")
+
+    thesis_metrics = {mk: aggregate_model(data.get("per_image", {})) for mk, data in loaded.items()}
+    significance = compute_significance(thesis_metrics)
+    metadata = _collect_report_metadata()
+
+    # Console summary.
+    print("\n================ CURE vs MAIRA-2 SUMMARY ================")
+    header = f"{'model':<8} {'N':>4} {'IoU':>7} {'F1@0.5':>7} {'mAP~':>7} {'kwF1':>7} {'sec':>7} {'err':>4}"
+    print(header)
+    print("-" * len(header))
+    for k in [m for m in ALL_MODELS if m in thesis_metrics]:
+        m = thesis_metrics[k]
+        t5 = m["thresholds"].get("0.50", {})
+        print(
+            f"{k:<8} {m['n_images']:>4} {m['mean_iou_macro']:>7.3f} "
+            f"{t5.get('f1_micro', 0.0):>7.3f} {m['map_like_50_95']:>7.3f} "
+            f"{m['keyword']['f1_micro']:>7.3f} {m['avg_latency_s']:>7.1f} {m['n_errors']:>4}"
+        )
+    print("=" * len(header))
+
+    # JSON payload (metrics only; per-image detail already on disk per model).
+    metrics_for_json = {}
+    for mk, m in thesis_metrics.items():
+        m2 = {kk: vv for kk, vv in m.items() if kk != "per_image"}
+        metrics_for_json[mk] = m2
+    json_payload = {
+        "metadata": metadata,
+        "significance": significance,
+        "metrics": metrics_for_json,
+    }
     json_path = os.path.join(OUTPUT_DIR, "comparison_results.json")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(json_payload, f, indent=2, ensure_ascii=False)
     print(f"Saved JSON: {json_path}")
 
+    # CSV.
     csv_path = os.path.join(OUTPUT_DIR, "comparison_summary.csv")
     csv_fields = [
         "model", "n_images",
         "mean_iou_micro", "mean_iou_macro", "mean_iou_std",
         "precision@0.5_micro", "recall@0.5_micro", "f1@0.5_micro",
-        "recall@0.3_micro", "hallucination@0.5",
+        "recall@0.3_micro", "map_like_50_95", "hallucination@0.5",
+        "keyword_precision_micro", "keyword_recall_micro", "keyword_f1_micro",
         "avg_latency_s", "total_pred_boxes", "total_gt_boxes", "errors",
     ]
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=csv_fields)
         writer.writeheader()
-        for k in MODELS:
-            if k not in thesis_metrics:
-                continue
+        for k in [m for m in ALL_MODELS if m in thesis_metrics]:
             m = thesis_metrics[k]
-            t5 = m["thresholds"].get("0.5", {})
-            t3 = m["thresholds"].get("0.3", {})
+            t5 = m["thresholds"].get("0.50", {})
+            t3 = m["thresholds"].get("0.30", {})
+            kw = m["keyword"]
             writer.writerow({
                 "model": k,
                 "n_images": m["n_images"],
@@ -1765,7 +1623,11 @@ def main() -> None:
                 "recall@0.5_micro": round(t5.get("recall_micro", 0.0), 4),
                 "f1@0.5_micro": round(t5.get("f1_micro", 0.0), 4),
                 "recall@0.3_micro": round(t3.get("recall_micro", 0.0), 4),
+                "map_like_50_95": round(m["map_like_50_95"], 4),
                 "hallucination@0.5": round(t5.get("hallucination_rate", 0.0), 4),
+                "keyword_precision_micro": round(kw["precision_micro"], 4),
+                "keyword_recall_micro": round(kw["recall_micro"], 4),
+                "keyword_f1_micro": round(kw["f1_micro"], 4),
                 "avg_latency_s": round(m["avg_latency_s"], 2),
                 "total_pred_boxes": m["total_pred_boxes"],
                 "total_gt_boxes": m["total_gt_boxes"],
@@ -1783,16 +1645,37 @@ def main() -> None:
         report_path=report_path,
         metadata=metadata,
         thesis_metrics=thesis_metrics,
-        samples=samples,
-        all_results=all_results,
+        significance=significance,
         plot_paths=plot_paths,
         output_dir=OUTPUT_DIR,
     )
     print(f"Saved report: {report_path}")
-
-    print(f"\nRun finished (UTC): {datetime.now(timezone.utc).isoformat(timespec='seconds')}")
     print(f"All outputs in: {OUTPUT_DIR}")
-    tee.close()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Compare CURE and MAIRA-2 on PadChest-GR grounded localization.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_select = sub.add_parser("select", help="Pin the shared image list (once).")
+    p_select.set_defaults(func=cmd_select)
+
+    p_run = sub.add_parser("run", help="Run ONE model over the pinned image list.")
+    p_run.add_argument("--model", required=True, choices=list(MODEL_REGISTRY))
+    p_run.set_defaults(func=cmd_run)
+
+    p_report = sub.add_parser("report", help="Aggregate per-model results into report.md.")
+    p_report.set_defaults(func=cmd_report)
+
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    args.func(args)
 
 
 if __name__ == "__main__":
