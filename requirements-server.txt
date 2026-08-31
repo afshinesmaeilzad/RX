@@ -1,0 +1,14 @@
+# The RX API box: serving + continual learning.
+#
+#   pip install -r requirements-cure.txt -r requirements-server.txt
+#
+# requirements-cure.txt brings transformers==4.55.4 + peft==0.17.1, the versions
+# the CURE adapter was saved with. Do not float them: other versions break the
+# adapter's modules_to_save mapping (KeyError on ...embed_tokens.weight).
+#
+# torch is deliberately unpinned — the GPU image usually ships one. If not:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+
+fastapi>=0.110
+uvicorn[standard]>=0.27
+python-multipart>=0.0.9

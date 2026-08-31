@@ -1,9 +1,10 @@
-# CUDA-enabled image for comparing CURE vs MAIRA-2 on chest X-rays (bf16).
-# The base image ships a CUDA 12.1 build of PyTorch. CURE and MAIRA-2 need
-# conflicting transformers versions, so the two model venvs are built AT RUNTIME
-# by scripts/run_vast.sh (using --system-site-packages to reuse this torch).
+# RX: the CURE serving + continual-learning API, on a CUDA host.
 #
-# The recommended path is the Vast.ai PyTorch template without Docker (see README).
+# The image installs the CURE pin set (transformers==4.55.4 + peft==0.17.1 —
+# the versions the adapter was saved with) directly, because the API only ever
+# serves CURE. The MAIRA-2 comparison still needs its own conflicting
+# transformers, so the `benchmark` compose profile builds that venv at runtime
+# via scripts/run_vast.sh.
 FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -21,18 +22,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+WORKDIR /app/RX
 
-# Copy the whole RX project (compare_models.py, requirements-*.txt, scripts/).
+# Dependencies first, so a code change does not re-install torch's neighbours.
+COPY requirements-base.txt requirements-cure.txt requirements-server.txt ./
+RUN pip install --no-cache-dir -r requirements-cure.txt -r requirements-server.txt
+
+# Then the project (rxapi/, compare_models.py, scripts/, outputs/).
 COPY . /app/RX
-RUN chmod +x /app/RX/entrypoint.sh /app/RX/scripts/run_vast.sh
+RUN chmod +x /app/RX/entrypoint.sh /app/RX/scripts/run_vast.sh /app/RX/serve.py
 
 # Defaults; override at runtime with -e / env_file. bf16 only (no 4-bit).
 ENV DEVICE=cuda \
+    DATA_DIR=/data \
+    RX_VAR=/var/rx \
+    OUTPUT_DIR=/app/RX/outputs/compare \
     N_IMAGES=200 \
     SHUFFLE_SEED=42 \
-    MODELS=cure,maira2 \
-    DATA_DIR=/data \
-    OUTPUT_DIR=/app/RX/outputs/compare
+    MODELS=cure,maira2
 
-ENTRYPOINT ["/app/RX/entrypoint.sh"]
+EXPOSE 8077
+
+# The API by default; the benchmark profile overrides this with entrypoint.sh.
+CMD ["python3", "serve.py", "--host", "0.0.0.0", "--port", "8077"]

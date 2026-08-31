@@ -1,42 +1,82 @@
-# Docker Compose for the CXR model comparison on a CUDA GPU host (e.g. Vast.ai).
+# RX API on a CUDA host (Vast.ai, Lambda, any GPU box).
 #
-# Usage:
-#   1. cp .env.example .env   and fill in HF_TOKEN + DATA_DIR_HOST
-#   2. docker compose build
-#   3. docker compose run --rm compare
+#   cp .env.example .env      # HF_TOKEN, RX_AUTH_TOKEN, DATA_DIR_HOST
+#   docker compose up api
 #
-# The dataset is NEVER baked into the image. It is bind-mounted read-only from
-# DATA_DIR_HOST (a local copy OR an rclone Google Drive mount) into /data.
+# Two bind mounts, both deliberate:
+#   /data  the PadChest-GR images + ground truth, read-only — never baked in
+#   /var   RX_VAR: adapters, corrections, jobs. Survives the instance; losing
+#          it loses every trained adapter version.
+# The HF cache is a named volume so a rebuilt container does not re-download
+# ~9 GB of weights.
 
 services:
-  compare:
+  api:
     build: .
-    image: rx-cxr-compare:latest
+    image: rx-cure-api:latest
     env_file:
       - .env
     environment:
       DEVICE: ${DEVICE:-cuda}
-      N_IMAGES: ${N_IMAGES:-200}
-      SHUFFLE_SEED: ${SHUFFLE_SEED:-42}
-      MODELS: ${MODELS:-cure,maira2}
+      RX_VAR: /var/rx
       DATA_DIR: /data
       OUTPUT_DIR: /app/RX/outputs/compare
+      RX_AUTH_TOKEN: ${RX_AUTH_TOKEN:?set a token in .env}
+      TRAIN_MIN_NEW_EXAMPLES: ${TRAIN_MIN_NEW_EXAMPLES:-100}
+      TRAIN_REPLAY_RATIO: ${TRAIN_REPLAY_RATIO:-3}
       HF_TOKEN: ${HF_TOKEN:-}
     volumes:
-      # Dataset (read-only). Point DATA_DIR_HOST at your local copy or rclone mount.
-      - ${DATA_DIR_HOST:-./data}:/data:ro
-      # Results land here on the host.
-      - ./outputs:/app/RX/outputs
-      # Persist the Hugging Face model cache between runs (avoids re-downloading).
+      - ${DATA_DIR_HOST:?set DATA_DIR_HOST in .env}:/data:ro
+      - rx-var:/var/rx
       - hf-cache:/root/.cache/huggingface
-    # GPU access (Docker Compose v2 + NVIDIA Container Toolkit).
+    ports:
+      - "${RX_PORT:-8077}:8077"
+    command: ["python3", "serve.py", "--host", "0.0.0.0", "--port", "8077"]
+    shm_size: "8gb"
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      # /health is open on purpose, and answers before the weights are loaded.
+      test: ["CMD", "python3", "-c",
+             "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8077/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+  # The benchmark, unchanged: one-shot, produces outputs/compare/.
+  benchmark:
+    build: .
+    image: rx-cure-api:latest
+    profiles: ["benchmark"]
+    env_file:
+      - .env
+    environment:
+      DEVICE: ${DEVICE:-cuda}
+      DATA_DIR: /data
+      OUTPUT_DIR: /app/RX/outputs/compare
+      N_IMAGES: ${N_IMAGES:-200}
+      SHUFFLE_SEED: ${SHUFFLE_SEED:-42}
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - ${DATA_DIR_HOST:?set DATA_DIR_HOST in .env}:/data:ro
+      - ./outputs:/app/RX/outputs
+      - hf-cache:/root/.cache/huggingface
+    entrypoint: ["./entrypoint.sh"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
               capabilities: [gpu]
 
 volumes:
+  rx-var:
   hf-cache:

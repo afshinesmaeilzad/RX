@@ -1,177 +1,159 @@
-# RX — CURE vs MAIRA-2 on PadChest-GR (grounded localization)
+# RX — CURE serving + continual learning (the cloud side)
 
-Compare two medical vision-language models on the **PadChest-GR** dataset for
-grounded chest-X-ray findings, scoring predicted bounding boxes against ground
-truth in **original-image pixel space** (IoU, precision/recall/F1, a score-free
-mAP-like surrogate) plus a lightweight keyword-vs-label match:
+The GPU half of CXR GroundAssist. Two jobs, one service:
 
-| Key | Model | HF repo |
-|-----|-------|---------|
-| `cure` | CURE (MedGemma-4B + LoRA) | [`pamessina/medgemma-4b-it-cure`](https://huggingface.co/pamessina/medgemma-4b-it-cure) |
-| `maira2` | MAIRA-2 (~7B) | [`microsoft/maira-2`](https://huggingface.co/microsoft/maira-2) |
-
-Both models output only **keyword findings + boxes** (the polished narrative
-report is future work, assembled later by OpenAI from the stored `{keyword, box}`
-findings). Everything runs in **bf16 full precision — no 4-bit / no bitsandbytes**.
-
-> **Why two environments?** CURE needs `transformers==4.55.4` + `peft==0.17.1`,
-> while MAIRA-2 needs `transformers==4.51.3`. These conflict in one process, so
-> each model runs in its own venv and writes results to disk; a final
-> transformers-free step aggregates them.
-
----
-
-## Pipeline (three subcommands)
+1. **Serve CURE** to the desktop app over HTTP, speaking the contract the app's
+   `RemoteEngine` already uses — pointing the app here is a URL change and
+   nothing else.
+2. **Run the continual-learning loop**: corrections come up from reviewers, a
+   training run *continues the existing adapter*, the gate scores the candidate
+   against the pinned benchmark, and only a version that passes can be promoted
+   to the one `/detect` serves.
 
 ```
-python compare_models.py select              # pin the shared image list (once)
-python compare_models.py run --model maira2  # in .venv-maira2 (tf 4.51.3)
-python compare_models.py run --model cure    # in .venv-cure   (tf 4.55.4 + peft)
-python compare_models.py report              # aggregate -> report.md (no transformers)
+ desktop app                     RX (this box, GPU)
+┌──────────────┐   POST /detect  ┌────────────────────────────────────┐
+│ engine.py    │ ───────────────►│ rxapi/inference.py   base + adapter│
+│ RemoteEngine │ ◄─────────────── │                      (one, always)│
+└──────────────┘   {keyword,box} └────────────────────────────────────┘
+       │                                        ▲
+       │ POST /corrections                      │ promote, if it passes
+       ▼                                        │
+┌──────────────┐   POST /train   ┌──────────────┴─────────────────────┐
+│ dataset.py   │ ───────────────►│ training.py  →  evaluation.py gate │
+│ 100 pending? │                 │ continue v1 → v2 → v3              │
+└──────────────┘                 └────────────────────────────────────┘
 ```
 
-`select` writes `outputs/compare/image_list.json` (`{seed, n_images, selected}`).
-**Both `run` calls read the same file**, so the two models score identical images.
-Each `run` writes `outputs/compare/per_model/<model>.json` with, per image, the
-`{keyword, box}` findings and all per-image detection numbers. `report` aggregates.
+## One adapter, versioned — never a stack
 
-`scripts/run_vast.sh` does all four steps for you (builds both venvs, orchestrates,
-aggregates).
+CURE is MedGemma-4B plus **one** LoRA adapter. Training continues *that*
+adapter and saves it as the next version; it never attaches a second LoRA on
+top of the first. The registry is therefore a straight line:
 
----
+| version | where | how it got there |
+|---|---|---|
+| `v1` | `pamessina/medgemma-4b-it-cure` (Hub) | the published seed |
+| `v2` | `var/adapters/v2` | v1 continued on the first 100 corrections |
+| `v3` | `var/adapters/v3` | v2 continued on the next 100 |
 
-## What you get (in `outputs/compare/`)
+`PeftModel.from_pretrained(base, parent, is_trainable=True)` is the line that
+makes this continuation rather than a fresh adapter — without `is_trainable`,
+peft loads the weights frozen and the run silently trains nothing.
 
-- `report.md` — thesis-ready report: reproducibility metadata, headline metrics,
-  precision/recall/F1 (micro + macro), 95% bootstrap CIs, a paired CURE-vs-MAIRA
-  significance test, per-pathology breakdown, and embedded plots.
-- `plots/` — bar charts: mean IoU (±std), P/R/F1@0.5, recall@0.3 vs 0.5,
-  mAP-like + hallucination rate, keyword F1, latency.
-- `comparison_results.json` — aggregated metrics + metadata + significance.
-- `comparison_summary.csv` — per-model headline table.
-- `per_model/<model>.json` — per-image `{keyword, box_norm, box_px}` findings
-  (the payload for the later OpenAI narrative-report step) + per-image scores.
-- `run_<model>.log` — full stdout/stderr transcript of each model run.
-- `per_image/*.png` — optional single-model box previews (set `SAVE_FIGURES=1`).
+## When training starts
 
-### Metrics reported (per model)
+Not on a trickle. `TRAIN_MIN_NEW_EXAMPLES` (default **100**) is the number of
+corrected cases that must have arrived *since the run that produced the active
+version*. Below it `/train` returns 409 and says how many short you are. A 4B
+model cannot be moved by a handful of cases, and a run that overfits them is
+worse than no run.
 
-- **Detection (pixel space):** precision/recall/F1 at IoU >= 0.3 and >= 0.5,
-  micro (pooled) and macro (per-image mean ± std), over **all** predicted boxes
-  with greedy one-to-one matching. Mean IoU of matched pairs. Hallucination rate.
-- **mAP-like@[.5:.95]:** mean micro-F1 across IoU 0.50:0.05:0.95. This is a
-  **score-free surrogate** — the generative models emit no box confidences, so a
-  true COCO AP / PR curve is undefined.
-- **Keyword match:** predicted finding keywords vs GT labels via stdlib `difflib`
-  (precision/recall/F1, micro + macro). A sanity signal for "did it name the right
-  finding", complementary to box IoU. No RadGraph/CheXbert/BLEU/ROUGE.
-- **Statistics:** 95% bootstrap CIs and a paired bootstrap significance test
-  (CURE vs MAIRA-2) on per-image IoU and F1@0.5.
+Every corrected case is mixed with `TRAIN_REPLAY_RATIO` (default 3) PadChest-GR
+examples, rebuilt into CURE's own output format so replay and correction
+examples are indistinguishable to the trainer. Without replay, a hundred cases
+would overwrite what the adapter learned from thousands.
 
----
+## The gate
 
-## Recommended hardware (Vast.ai)
+A candidate is scored on **the same pinned 200-image list** that produced the
+published baseline in `outputs/compare/`, using `compare_models.py` itself —
+not a reimplementation, because a second copy would drift and every promotion
+decision would rest on numbers not comparable with the thesis.
 
-| Resource | Recommended |
-|----------|-------------|
-| GPU VRAM | **>= 24 GB — 1× RTX 4090** (bf16 full precision; each model loads one at a time) |
-| Disk | **~80 GB** (OS + two venvs + ~31 GB model cache + dataset) |
-| System RAM | **32 GB** |
+Promotion is refused unless the candidate has been evaluated and did not
+regress beyond `evaluation.REGRESSION_TOLERANCE`:
 
-`run_vast.sh` warns if it detects < 24 GB VRAM.
+| metric | tolerance |
+|---|---|
+| `mean_iou_micro` | may not drop more than 0.005 |
+| `f1@0.5_micro` | may not drop more than 0.005 |
+| `hallucination@0.5` | may not rise more than 0.010 |
 
----
+Deltas come with the paired bootstrap the thesis report uses. `force=true`
+overrides, and is meant for debugging, not for shipping.
 
-## Run on Vast.ai (PyTorch template, no Docker)
+## API
 
-A Vast.ai instance is already a container, so running directly on the **PyTorch**
-template is simplest.
+| method | route | what it does |
+|---|---|---|
+| `GET` | `/health` | open, unauthenticated — device, active version, running job |
+| `POST` | `/detect` | raw image bytes + `X-Image-Name` → the worker's payload |
+| `POST` | `/model/load` | pull weights now instead of on the first X-ray |
+| `POST` | `/corrections` | ingest the app's export (JSON array, object, or JSONL) |
+| `GET` | `/corrections/stats` | totals, pending count, how far from the threshold |
+| `GET` | `/versions` | the lineage, which is active, gate result per version |
+| `POST` | `/versions/{v}/activate` | promote — refused unless the gate passed |
+| `POST` | `/train` | continue the active adapter (`dry_run` walks it with no GPU) |
+| `POST` | `/evaluate` | score a version against the baseline |
+| `GET` | `/jobs`, `/jobs/{id}` | status, progress, log tail |
 
-### 1. Rent an instance
-- Template: **PyTorch (Vast)** or **PyTorch NGC** (CUDA + PyTorch + SSH)
-- GPU: **1× RTX 4090 (24 GB)**, Disk **~80 GB**
+Auth is a shared token in `X-Auth-Token` — the header the app already sends.
+It is a gate for a tunnelled or private-network deployment, **not** an
+internet-facing authentication system. Do not expose this port publicly with
+patient data behind it.
 
-### 2. Clone + configure token + get the data
+Training and evaluation hold the GPU, so `/detect` returns 503 while a job
+runs, and only one job runs at a time.
+
+## Run it
+
 ```bash
-git clone https://github.com/afshinesmaeilzad/RX.git
-cd RX
-export HF_TOKEN=hf_xxx        # accept the model licenses on HF first (see below)
-# Point DATA_DIR at your dataset root (local copy recommended for 200 images).
+python3 -m venv .venv-cure && . .venv-cure/bin/activate
+pip install -r requirements-cure.txt -r requirements-server.txt
+# torch comes from the GPU image; if not:
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+
+RX_AUTH_TOKEN=secret DATA_DIR=/data python3 serve.py --host 0.0.0.0 --port 8077
 ```
 
-`DATA_DIR` must contain:
+Then in the app: **Settings → Where CURE runs → Remote**, URL and the same
+token. The model is not loaded at startup — `/health` answers while the ~9 GB
+of weights are still coming down.
+
+## Configuration
+
+| variable | default | meaning |
+|---|---|---|
+| `RX_VAR` | `RX/var` | all mutable state; mount this as a volume |
+| `RX_AUTH_TOKEN` | *(empty)* | shared token; empty disables the check |
+| `BASE_MODEL_ID` | `google/medgemma-4b-it` | never changes |
+| `SEED_ADAPTER_ID` | `pamessina/medgemma-4b-it-cure` | version `v1` |
+| `TRAIN_MIN_NEW_EXAMPLES` | `100` | the collection threshold |
+| `TRAIN_REPLAY_RATIO` | `3` | PadChest-GR examples per correction |
+| `DATA_DIR` | repo parent | PadChest-GR images + `grounded_reports_*.json` |
+| `OUTPUT_DIR` | `RX/outputs/compare` | the baseline run and its pinned image list |
+| `DEVICE` | `auto` | `auto` \| `cuda` \| `mps` \| `cpu` |
+
+## What is verified, and what is not
+
+The API is covered end to end without a GPU: routes, auth, ingestion, the
+threshold refusal, the job lifecycle, the version lineage, and promotion being
+blocked for an unevaluated or regressed candidate. The gate arithmetic is
+checked against the real stored baseline — comparing that run with itself gives
+a zero delta and reproduces `f1@0.5 = 0.3406`.
+
+**The training loop itself has never been executed.** It needs a GPU and a
+correction set that does not exist yet. `POST /train {"dry_run": true}` walks
+everything around it — dataset assembly, replay mixing, version naming — and is
+what the tests exercise. Treat the first real run as a bring-up, not a result:
+watch the loss and the trainable-parameter count in the job log before trusting
+anything it produces.
+
+## The benchmark, still here
+
+`compare_models.py` (CURE vs MAIRA-2 on PadChest-GR) and its published run in
+`outputs/compare/` are kept: they define the metrics, and they are the baseline
+the gate measures against.
+
 ```
-grounded_reports_20240819.json
-Padchest_GR_files/            # the .png chest X-rays (or Padchest_GR_files/PadChest_GR/)
-```
-
-Accept the licenses once while logged in to Hugging Face:
-- https://huggingface.co/google/medgemma-4b-it  (CURE base)
-- https://huggingface.co/pamessina/medgemma-4b-it-cure  (CURE adapter)
-- https://huggingface.co/microsoft/maira-2
-
-### 3. Run it (one command)
-```bash
-# Small smoke test (2 images, both models):
-DATA_DIR=/data N_IMAGES=2 ./scripts/run_vast.sh
-
-# Full run:
-DATA_DIR=/data N_IMAGES=200 ./scripts/run_vast.sh
-```
-
-`run_vast.sh` builds `.venv-maira2` and `.venv-cure` (both with
-`--system-site-packages`, reusing the template's CUDA torch), runs each model in
-its venv, then aggregates. Re-runs are idempotent (existing venvs are reused).
-Results land in `outputs/compare/`.
-
----
-
-## Configuration (env vars)
-
-| Variable | Default | Meaning |
-|----------|---------|---------|
-| `HF_TOKEN` | — | Hugging Face read token (required for gated models) |
-| `DATA_DIR` | `/data` (script) | Dataset root (`grounded_reports_*.json` + `Padchest_GR_files/`) |
-| `N_IMAGES` | `200` | Number of images to evaluate |
-| `SHUFFLE_SEED` | `42` | Selection seed (deterministic image list) |
-| `DEVICE` | `cuda` | `cuda` or `cpu` |
-| `MODELS` | `cure,maira2` | Subset for `run_vast.sh`, e.g. `cure` or `maira2` |
-| `SAVE_FIGURES` | `0` | `1` = save per-image box previews during `run` |
-| `FORCE_RESELECT` | `0` | `1` = re-pick the image list even if it exists |
-
----
-
-## Manual run (advanced)
-
-If you prefer to drive the venvs yourself:
-```bash
-python3 -m venv --system-site-packages .venv-maira2
-.venv-maira2/bin/pip install -r requirements-maira2.txt
-python3 compare_models.py select
-DEVICE=cuda .venv-maira2/bin/python compare_models.py run --model maira2
-
-python3 -m venv --system-site-packages .venv-cure
-.venv-cure/bin/pip install -r requirements-cure.txt
-DEVICE=cuda .venv-cure/bin/python compare_models.py run --model cure
-
-.venv-cure/bin/python compare_models.py report
+CURE     mean IoU 0.369 ± 0.296 | F1@0.5 0.341 | hallucination@0.5 0.631 | keyword F1 0.249
+MAIRA-2  mean IoU 0.286 ± 0.281 | F1@0.5 0.245 | hallucination@0.5 0.709 | keyword F1 0.218
 ```
 
----
+`rescore_offline.py` answers "would this post-processing rule have helped?" from
+the stored predictions, with no GPU. Three rules measured so far — sentence
+dedup, dropping negations, box rescaling — are all neutral or harmful, which is
+why the remaining lever is the model itself.
 
-## Notes & caveats
-
-- IoU is computed in **original-image pixel coordinates** for both models (CURE
-  cxcywh, MAIRA-2 xyxy and GT are all mapped to original W×H px first), so aspect
-  ratio is honoured identically.
-- `mAP-like@[.5:.95]` is a score-free surrogate (mean micro-F1 across IoU
-  thresholds); true COCO AP is undefined without per-box confidences.
-- Keyword matching is lexical (difflib ratio >= 0.8 or substring), a sanity signal
-  rather than a clinical NLG metric.
-- **CURE troubleshooting:** the adapter was saved with `transformers==4.55.4` +
-  `peft==0.17.1`; other versions raise `KeyError: ...embed_tokens.weight`. Load
-  with `AutoModelForImageTextToText` (CURE needs the vision encoder) and attach
-  the LoRA directly — do **not** untie embeddings. Clear a corrupt cache with
-  `rm -rf ~/.cache/huggingface/hub/models--pamessina--medgemma-4b-it-cure`.
-- The narrative report and any report-text NLG metrics are **future work**,
-  assembled by OpenAI from the stored `{keyword, box}` findings.
+See `docs/` in the app repo for the reviewer-facing side.
