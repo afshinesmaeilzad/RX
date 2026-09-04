@@ -126,13 +126,29 @@ def resolve_rule(name: str) -> Callable[[list[dict[str, Any]]], list[dict[str, A
 # --------------------------------------------------------------------------
 
 
+def load_splits(master_csv: Path) -> dict[str, str]:
+    """ImageID -> official PadChest-GR split (train / validation / test)."""
+    import csv
+    splits: dict[str, str] = {}
+    if not master_csv.is_file():
+        return splits
+    with master_csv.open() as fh:
+        for row in csv.DictReader(fh):
+            image_id = row.get("ImageID")
+            if image_id:
+                splits[image_id] = (row.get("split") or "").strip()
+    return splits
+
+
 def rescore(run: dict[str, Any], gt_by_id: dict[str, Any],
-            rules: list[str]) -> dict[str, Any]:
+            rules: list[str], keep_ids: set[str] | None = None) -> dict[str, Any]:
     """Re-parse every stored prediction, apply the rules, score it again."""
     per_image: dict[str, dict[str, Any]] = {}
     for image_id, payload in run["per_image"].items():
+        if keep_ids is not None and image_id not in keep_ids:
+            continue
         entry = copy.deepcopy(payload)
-        if entry.get("error"):
+        if entry.get("error") or "orig_size" not in entry:
             per_image[image_id] = entry
             continue
 
@@ -190,6 +206,12 @@ def main() -> int:
                     help="comma-separated rules: " + ", ".join(RULES))
     ap.add_argument("--check", action="store_true",
                     help="only verify the harness reproduces the published run")
+    ap.add_argument("--split", default="",
+                    help="restrict to an official PadChest-GR split: train|validation|test. "
+                         "Both CURE and MAIRA-2 were trained on PadChest-GR, so only "
+                         "'test' is a generalization estimate.")
+    ap.add_argument("--master-csv", type=Path,
+                    default=Path(cm.DATA_DIR) / "master_table.csv")
     args = ap.parse_args()
 
     if not args.run.is_file():
@@ -203,11 +225,24 @@ def main() -> int:
     gt_by_id = cm.load_gt_index(str(args.gt))
     model = run.get("model", args.run.stem)
 
-    base = rescore(run, gt_by_id, [])
+    keep_ids = None
+    if args.split:
+        splits = load_splits(args.master_csv)
+        if not splits:
+            print(f"no split table at {args.master_csv}", file=sys.stderr)
+            return 1
+        keep_ids = {i for i, s in splits.items() if s == args.split}
+        print(f"restricted to the '{args.split}' split "
+              f"({len(keep_ids & set(run['per_image']))} of "
+              f"{len(run['per_image'])} scored images)")
+
+    base = rescore(run, gt_by_id, [], keep_ids)
     base_head = headline(base)
 
     # ------------------------------------------------------ the guard
-    ref = published(args.run.parent.parent / "comparison_summary.csv", model)
+    # The published summary covers the whole run; a split subset cannot match it.
+    ref = None if args.split else published(
+        args.run.parent.parent / "comparison_summary.csv", model)
     print(f"re-scored {base['n_images']} image(s) from {args.run.name}\n")
     if ref:
         print("harness check — recomputed vs published")
@@ -240,7 +275,7 @@ def main() -> int:
               file=sys.stderr)
         return 1
 
-    fixed = rescore(run, gt_by_id, rules)
+    fixed = rescore(run, gt_by_id, rules, keep_ids)
     fixed_head = headline(fixed)
 
     print(f"effect of: {' + '.join(rules)}\n")

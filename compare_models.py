@@ -133,6 +133,12 @@ PER_MODEL_DIR = os.path.join(OUTPUT_DIR, "per_model")
 IMAGE_LIST_PATH = os.path.join(OUTPUT_DIR, "image_list.json")
 
 N_IMAGES = int(os.environ.get("N_IMAGES", "200"))
+# PadChest-GR ships an official split. Both CURE and MAIRA-2 were trained on
+# this dataset, so a sample drawn from the whole of it measures memorisation as
+# much as skill: set SPLIT=test for a generalization estimate. Empty keeps the
+# original behaviour, which is what the first published run used.
+SPLIT = os.environ.get("SPLIT", "").strip().lower()
+MASTER_TABLE = os.environ.get("MASTER_TABLE") or os.path.join(DATA_DIR, "master_table.csv")
 SHUFFLE_SEED = int(os.environ["SHUFFLE_SEED"]) if os.environ.get("SHUFFLE_SEED") else 42
 DEFAULT_VERIFY_IMAGE = "106997070894779966614346591942916625787_fsxv2a.png"
 
@@ -501,6 +507,19 @@ def evaluate_keywords(
 # ---------------------------------------------------------------------------
 
 
+def load_split_index(master_csv: str) -> dict[str, str]:
+    """ImageID -> official split (train | validation | test), from master_table.csv."""
+    index: dict[str, str] = {}
+    if not os.path.exists(master_csv):
+        return index
+    with open(master_csv, "r", encoding="utf-8") as fh:
+        for row in csv.DictReader(fh):
+            image_id = row.get("ImageID")
+            if image_id:
+                index[image_id] = (row.get("split") or "").strip().lower()
+    return index
+
+
 def has_gt_box(entry: dict[str, Any]) -> bool:
     for f in entry.get("findings", []) or []:
         if f.get("boxes"):
@@ -520,12 +539,25 @@ def select_images(
     n_images: int,
     shuffle_seed: int | None,
     prefer_image: str | None = None,
+    split: str = "",
 ) -> list[str]:
     all_files = sorted(
         fn for fn in os.listdir(images_dir)
         if fn.lower().endswith((".png", ".jpg", ".jpeg"))
     )
     candidates = [fn for fn in all_files if fn in gt_by_id and has_gt_box(gt_by_id[fn])]
+
+    if split:
+        index = load_split_index(MASTER_TABLE)
+        if not index:
+            raise RuntimeError(
+                f"SPLIT={split} was requested but no split table at {MASTER_TABLE}."
+            )
+        before = len(candidates)
+        candidates = [fn for fn in candidates if index.get(fn) == split]
+        print(f"split={split}: {len(candidates)} of {before} candidate image(s)")
+        if not candidates:
+            raise RuntimeError(f"no images with ground-truth boxes in split '{split}'")
 
     selected: list[str] = []
     if prefer_image and prefer_image in candidates:
@@ -1400,12 +1432,14 @@ def cmd_select(_: argparse.Namespace) -> None:
 
     gt_by_id = load_gt_index(JSON_PATH)
     prefer = DEFAULT_VERIFY_IMAGE if N_IMAGES == 1 else None
-    selected = select_images(IMAGES_DIR, gt_by_id, N_IMAGES, SHUFFLE_SEED, prefer_image=prefer)
+    selected = select_images(IMAGES_DIR, gt_by_id, N_IMAGES, SHUFFLE_SEED,
+                             prefer_image=prefer, split=SPLIT)
 
     state = {
         "seed": SHUFFLE_SEED,
         "n_images": N_IMAGES,
         "n_selected": len(selected),
+        "split": SPLIT or "all",
         "selected": selected,
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
