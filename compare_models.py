@@ -36,6 +36,10 @@ Env vars:
     OUTPUT_DIR    output dir           [default: <script>/outputs/compare]
     N_IMAGES      how many images      [default: 200]
     SHUFFLE_SEED  selection seed       [default: 42]
+    SPLIT         official split to select from: test | validation | train
+                  [default: empty = every image, which is how the leaked
+                  published run was produced. Generalization claims need test.]
+    MASTER_TABLE  PadChest-GR split table [default: <DATA_DIR>/master_table.csv]
     DEVICE        cuda | mps | cpu     [default: cpu]
     MODELS        subset for `run`/`report` order [default: cure,maira2]
     SAVE_FIGURES  1 = save per-image preview pngs in `run` [default: 0]

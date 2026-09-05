@@ -123,6 +123,8 @@ of weights are still coming down.
 | `TRAIN_REPLAY_RATIO` | `3` | PadChest-GR examples per correction |
 | `DATA_DIR` | repo parent | PadChest-GR images + `grounded_reports_*.json` |
 | `OUTPUT_DIR` | `RX/outputs/compare` | the baseline run and its pinned image list |
+| `SPLIT` | *(empty)* | `test` restricts selection to the official held-out split. Empty reproduces the original, leaked selection — deliberate, so the published run stays reproducible. **Any generalization claim needs `SPLIT=test`.** |
+| `MASTER_TABLE` | `$DATA_DIR/master_table.csv` | PadChest-GR's official split table; required by `SPLIT` |
 | `DEVICE` | `auto` | `auto` \| `cuda` \| `mps` \| `cpu` |
 
 ## What is verified, and what is not
@@ -150,6 +152,26 @@ the gate measures against.
 CURE     mean IoU 0.369 ± 0.296 | F1@0.5 0.341 | hallucination@0.5 0.631 | keyword F1 0.249
 MAIRA-2  mean IoU 0.286 ± 0.281 | F1@0.5 0.245 | hallucination@0.5 0.709 | keyword F1 0.218
 ```
+
+> **These are not generalization numbers — do not quote them as such.** Both
+> models were trained on PadChest-GR, and this run ignored the dataset's
+> official split: 129 of its 200 images (64%) were training data for both. It
+> is kept because it is reproducible and it is what the adoption gate measures
+> against, not because it describes held-out performance.
+
+The held-out run is `../cxr_gui/outputs/compare_test/` — 200 test-split images, seed 42,
+2026-09-05. There the ranking reverses:
+
+```
+CURE     mean IoU 0.418 ± 0.266 | F1@0.5 0.210 | hallucination@0.5 0.769 | keyword F1 0.158
+MAIRA-2  mean IoU 0.446 ± 0.287 | F1@0.5 0.253 | hallucination@0.5 0.712 | keyword F1 0.231
+```
+
+Paired over the 198 images both models scored, MAIRA-2 leads on F1@0.5 by 0.054
+(p=0.017) and on keyword F1 by 0.088 (p<0.001); the IoU gap is not significant
+(p=0.091). CURE loses 38% of its F1 between the two runs while MAIRA-2 is
+unchanged — that asymmetry, not the ranking flip, is the evidence. See
+`CLAUDE.md` for how to phrase the claim.
 
 `rescore_offline.py` answers "would this post-processing rule have helped?" from
 the stored predictions, with no GPU. Three rules measured so far — sentence
