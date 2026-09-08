@@ -75,10 +75,14 @@ makes offline re-scoring possible; do not prune those files.
 200 held-out test images, seed 42, CUDA, bf16, 2026-09-05, commit `3860d5d`,
 torch 2.11.0+cu128. Only 16 of these 200 appear in the leaked list.
 
-| model | mean IoU | F1@0.5 | mAP-like | halluc@0.5 | keyword F1 | s/img | n |
+| model | mean IoU (macro±std) | F1@0.5 | mAP-like | halluc@0.5 | keyword F1 | s/img | n |
 |---|---|---|---|---|---|---|---|
-| CURE | 0.418 ± 0.266 | 0.210 | 0.078 | 0.769 | 0.158 | 2.6 | 200 |
-| MAIRA-2 | 0.446 ± 0.287 | 0.253 | 0.109 | 0.712 | 0.231 | 1.0 | 198 |
+| CURE | 0.281 ± 0.266 | 0.210 | 0.078 | 0.769 | 0.158 | 2.6 | 200 |
+| MAIRA-2 | 0.311 ± 0.287 | 0.253 | 0.109 | 0.712 | 0.231 | 1.0 | 198 |
+
+Both tables quote **macro** mean IoU (mean of per-image means), so they compare
+like with like. The CSV also carries `mean_iou_micro` (pooled over all matched
+pairs, CURE 0.504 → 0.418); never mix the two across tables.
 
 Paired bootstrap, CURE − MAIRA-2, over the 198 images both models scored:
 
@@ -99,16 +103,22 @@ Paired bootstrap, CURE − MAIRA-2, over the 198 images both models scored:
   significant (p=0.091). The defensible claim: MAIRA-2 achieves higher
   detection F1 and names findings better; the quality of the boxes each model
   *does* match is statistically indistinguishable.
-- **Mean IoU goes *up* for both models on the clean split** (CURE 0.369 →
-  0.418). That is not "the boxes got better" — mean IoU is over matched pairs
-  only, so with fewer matches the survivors are the easy ones. Say so, or it
-  reads backwards.
+- **Every metric moves against CURE and none against MAIRA-2.** Macro mean IoU
+  0.369 → 0.281 for CURE, 0.286 → 0.311 for MAIRA-2; F1 0.341 → 0.210 vs
+  0.245 → 0.253; hallucination 0.631 → 0.769 vs 0.709 → 0.712. No caveat
+  needed — state the asymmetry plainly.
 - Torch differs between the two runs (2.6.0+cu124 vs 2.11.0+cu128). Very
   unlikely to move F1 by 0.13, but disclose it rather than be asked.
 - MAIRA-2 errored on 2 of the 200 images. `cmd_run` prints `{exc}` with no
   traceback and both messages were empty, so the cause is unrecoverable from
   the logs. The paired test correctly uses the 198 both models scored, so the
   statistics are unaffected — but log `repr(exc)` next time.
+
+**CURE respected the official split.** On the leaked run, its scores by split
+are train 0.422 / validation 0.180 / test 0.181 F1@0.5 — validation behaves
+exactly like test, so PadChest-GR *validation* (455 studies) is genuinely
+unseen data for CURE. That makes it the right source for simulated corrections,
+with test kept untouched as the measuring stick.
 
 **Results live in `cxr_gui/outputs/`, not here.** This repo's `.gitignore`
 ignores `outputs/`, so anything written to `RX/outputs/` is untracked and one

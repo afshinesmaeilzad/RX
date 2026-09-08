@@ -61,6 +61,7 @@ import statistics
 import subprocess
 import sys
 import time
+import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -1522,7 +1523,13 @@ def cmd_run(args: argparse.Namespace) -> None:
                         fig_dir, f"{model_key}_{os.path.splitext(image_id)[0]}.png"))
             except Exception as exc:  # noqa: BLE001
                 print(f"[{model_key}] {idx}/{len(selected)} {image_id}  [ERROR] {exc}")
-                per_image[image_id] = {"error": str(exc), "latency_s": 0.0}
+                # repr, not str: two MAIRA-2 failures in the test run stored an
+                # empty message and the cause was unrecoverable afterwards.
+                per_image[image_id] = {
+                    "error": repr(exc),
+                    "traceback": traceback.format_exc(),
+                    "latency_s": 0.0,
+                }
 
         free_model(model, processor)
 
