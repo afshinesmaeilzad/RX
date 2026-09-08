@@ -24,19 +24,33 @@
 #
 # Env overrides:
 #   DATA_DIR   dataset root (grounded_reports_*.json + Padchest_GR_files/)  [default /data]
-#   N_IMAGES   number of images                                            [default 200]
+#   N_IMAGES   number of images                                            [default 604]
+#   SPLIT      official PadChest-GR split to draw from                     [default test]
+#   OUTPUT_DIR where results are written                        [default outputs/compare_$SPLIT]
 #   SHUFFLE_SEED  selection seed                                           [default 42]
 #   MODELS     subset to run, e.g. "cure" or "maira2"                      [default cure,maira2]
 #   DEVICE     cuda | cpu                                                  [default cuda]
+#
+# SPLIT matters more than anything else here. Both CURE and MAIRA-2 were
+# trained on PadChest-GR, so a sample drawn from the whole dataset measures
+# memorisation: the first run of this benchmark took 64% of its images from the
+# train split and reported the opposite ranking to the held-out one. Leave
+# SPLIT=test unless you are deliberately reproducing that.
+#
+# Results are written under OUTPUT_DIR and are NOT in this repo's git (see
+# .gitignore) — copy them somewhere versioned when the run finishes, or point
+# OUTPUT_DIR at a tracked directory.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
 
 export DEVICE="${DEVICE:-cuda}"
-export N_IMAGES="${N_IMAGES:-200}"
+export N_IMAGES="${N_IMAGES:-604}"          # every test-split study that has GT boxes
+export SPLIT="${SPLIT:-test}"               # held-out by default; "" = the old behaviour
 export SHUFFLE_SEED="${SHUFFLE_SEED:-42}"
 export DATA_DIR="${DATA_DIR:-/data}"
+export OUTPUT_DIR="${OUTPUT_DIR:-$SCRIPT_DIR/outputs/compare_${SPLIT:-all}}"
 MODELS="${MODELS:-cure,maira2}"
 
 VENV_MAIRA=".venv-maira2"
@@ -54,6 +68,23 @@ fi
 echo "=================================================="
 echo " RX CXR comparison — CURE vs MAIRA-2 (bf16, Vast.ai)"
 echo "=================================================="
+echo " split      = ${SPLIT:-<whole dataset — NOT a generalization estimate>}"
+echo " n_images   = $N_IMAGES  (seed $SHUFFLE_SEED)"
+echo " models     = $MODELS"
+echo " output     = $OUTPUT_DIR"
+if [ -z "${SPLIT}" ]; then
+    echo ""
+    echo "[WARNING] SPLIT is empty: images will be drawn from the whole of"
+    echo "          PadChest-GR, which both models were trained on. Numbers"
+    echo "          from such a run cannot be quoted as generalization."
+fi
+case "$OUTPUT_DIR" in
+    "$SCRIPT_DIR"/outputs/*)
+        echo ""
+        echo "[NOTE] $OUTPUT_DIR is inside this repo's ignored outputs/."
+        echo "       Copy the results out when the run finishes."
+        ;;
+esac
 
 # 1. Sanity checks ----------------------------------------------------------
 if [ -z "${HF_TOKEN:-}" ] && [ -z "${HUGGING_FACE_HUB_TOKEN:-}" ]; then
@@ -100,7 +131,7 @@ want_model () { case ",$MODELS," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
 
 # 3. Select the shared image list (once) ------------------------------------
 echo ""
-echo "== Selecting image list (N_IMAGES=$N_IMAGES, seed=$SHUFFLE_SEED) =="
+echo "== Selecting image list (N_IMAGES=$N_IMAGES, split=${SPLIT:-all}, seed=$SHUFFLE_SEED) =="
 "$PYTHON" compare_models.py select
 
 # 4. MAIRA-2 -----------------------------------------------------------------

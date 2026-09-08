@@ -141,6 +141,38 @@ needs the model.
 
 ---
 
+## Where we are (2026-09-06)
+
+Done: the benchmark twice (leaked run, then the clean 200-image test-split
+run), `SPLIT` support through selection / re-scoring / `run_vast.sh`, three
+post-processing rules measured and all rejected, `rxapi/` written with its code
+paths tested (training only as `dry_run`), and the 604-image evaluation list
+pinned.
+
+Decided:
+
+- **CURE only.** MAIRA-2 stays a comparator, not a second product. CURE is a
+  LoRA adapter on an open base and is the only one of the two that can actually
+  be iterated on; MAIRA-2 is a 7B model under a restrictive research licence.
+  Say plainly in the thesis that CURE scores lower on held-out data and that
+  this is an engineering choice, not a performance claim.
+- **Corrections come from the validation split** — never train (already seen by
+  CURE) and never test (the measuring stick). 455 studies: enough for the
+  100-case threshold and for a 50/150/300/455 learning curve.
+- **Pre-registered target.** CURE-v1 scores 0.210 F1@0.5 held-out, MAIRA-2
+  0.253. Success is closing that 0.043 gap. Write the target down before
+  running and report whatever comes out.
+
+Expect a null result: 455 examples against the tens of thousands CURE was
+trained on, from the same distribution, against errors already shown not to be
+systematic. Design for that — the oracle framing turns a null into an **upper
+bound** ("even with noise-free corrections at this volume, no measurable
+gain"), which is stronger than a null from noisy human corrections. Fix a
+stopping rule now: if the first clean run does not move F1, write it up rather
+than chasing hyperparameters.
+
+---
+
 ## The server API (`rxapi/`)
 
 FastAPI, started by `serve.py`. Install
@@ -208,10 +240,19 @@ write, no torch). Treat the first real run as debugging, not as an experiment.
 1. ~~Re-run the comparison on the test split.~~ **Done 2026-09-05** —
    `../cxr_gui/outputs/compare_test/`. The reversal is confirmed; write it up from the
    "How to state this" notes above.
+1b. **Run the 604-image evaluation** — the baseline the gate compares against,
+   and the headline for the comparison chapter:
+   ```
+   DATA_DIR=/data SPLIT=test N_IMAGES=604 \
+   OUTPUT_DIR=/path/to/cxr_gui/outputs/compare_test604 ./scripts/run_vast.sh
+   ```
+   The list is pinned already. Commit the results into `cxr_gui/outputs/`.
+   Decide *before* looking that 604 is the headline and 200 was preliminary —
+   choosing afterwards is cherry-picking.
 2. **Oracle corrections from ground truth.** PadChest-GR is radiologist
    annotation, so the "reviewer" can be simulated: move each predicted box onto
    its matched GT box, delete unmatched predictions, add unmatched GT, relabel
-   where the keyword differs. Produce them from `train` only. Call it an
+   where the keyword differs. Produce them from **`validation`** only. Call it an
    *oracle reviewer* in writing, never "radiologist corrections" — it is an
    upper bound, because a real reviewer sees less, is inconsistent, and makes
    mistakes of their own.
