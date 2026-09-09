@@ -124,8 +124,50 @@ with test kept untouched as the measuring stick.
 ignores `outputs/`, so anything written to `RX/outputs/` is untracked and one
 `git clean` from gone. `cxr_gui/outputs/` *is* versioned — the published
 baseline is committed there. Run with `OUTPUT_DIR` pointing at the cxr_gui
-tree, or copy results across afterwards, and commit them. A byte-identical
-duplicate currently sits in `RX/outputs/compare_test/`; delete it.
+tree, or copy results across afterwards, and commit them. `RX/outputs/` also
+holds a working copy of the runs — convenient on the GPU box, but it is
+gitignored, so never treat it as the record.
+
+### The oracle reviewer (`scripts/simulate_corrections.py`)
+
+Turns a finished prediction run plus PadChest-GR ground truth into the same
+correction JSONL the desktop app exports, so the output POSTs straight to
+`/corrections`.
+
+```bash
+python3 scripts/simulate_corrections.py --run outputs/val455/per_model/cure.json \
+    --split validation --out exports/oracle_validation.jsonl
+```
+
+Four edits, derived per image:
+
+| situation | edit |
+|---|---|
+| predicted box matches a GT box above `--match-iou` (0.3) | box moved to the GT box |
+| the keyword does not match the GT wording | keyword replaced |
+| predicted box matches nothing | deleted, recorded in `removed[]` |
+| GT box matched nothing | added |
+
+Matching uses `compare_models.greedy_match_boxes` in original pixel
+coordinates, so what the oracle corrects and what the metric counts as a hit
+cannot disagree.
+
+**Unboxed sentences the model produced are left alone.** This is a deliberate
+decision and the first version got it wrong: PadChest-GR often decomposes a
+report into a single finding where CURE emitted five normal statements, so
+rebuilding the target purely from the reference deleted all of them — training
+the model to stop saying "no pleural effusion". `--fix drop-negations` already
+measured that behaviour as a keyword-F1 loss. A reviewer corrects boxes, not
+prose.
+
+Validated on the 29 validation images inside the leaked run: 28 findings
+accepted as-is, 21 boxes moved, 17 keywords replaced, 40 deleted, 55 added, and
+all 29 examples pass `rxapi.dataset.validate`. **45% of CURE's predicted boxes
+had no ground-truth match at IoU 0.3** — a number worth quoting on its own.
+
+Say *oracle reviewer* in writing, never "radiologist corrections": it sees every
+error, never disagrees with itself, and never makes a mistake of its own, so
+what it measures is an upper bound.
 
 ### Post-processing rules already measured — all negative
 
@@ -146,8 +188,11 @@ needs the model.
 Done: the benchmark twice (leaked run, then the clean 200-image test-split
 run), `SPLIT` support through selection / re-scoring / `run_vast.sh`, three
 post-processing rules measured and all rejected, `rxapi/` written with its code
-paths tested (training only as `dry_run`), and the 604-image evaluation list
-pinned.
+paths tested (training only as `dry_run`), the 604-image evaluation list
+pinned, and the oracle reviewer built and validated.
+
+**Everything that can be done without a GPU is done.** The next three steps all
+need the box.
 
 Decided:
 
@@ -235,31 +280,85 @@ write, no torch). Treat the first real run as debugging, not as an experiment.
 
 ---
 
-## What is next
+## What is next — the GPU session, in order
 
-1. ~~Re-run the comparison on the test split.~~ **Done 2026-09-05** —
-   `../cxr_gui/outputs/compare_test/`. The reversal is confirmed; write it up from the
-   "How to state this" notes above.
-1b. **Run the 604-image evaluation** — the baseline the gate compares against,
-   and the headline for the comparison chapter:
-   ```
-   DATA_DIR=/data SPLIT=test N_IMAGES=604 \
-   OUTPUT_DIR=/path/to/cxr_gui/outputs/compare_test604 ./scripts/run_vast.sh
-   ```
-   The list is pinned already. Commit the results into `cxr_gui/outputs/`.
-   Decide *before* looking that 604 is the headline and 200 was preliminary —
-   choosing afterwards is cherry-picking.
-2. **Oracle corrections from ground truth.** PadChest-GR is radiologist
-   annotation, so the "reviewer" can be simulated: move each predicted box onto
-   its matched GT box, delete unmatched predictions, add unmatched GT, relabel
-   where the keyword differs. Produce them from **`validation`** only. Call it an
-   *oracle reviewer* in writing, never "radiologist corrections" — it is an
-   upper bound, because a real reviewer sees less, is inconsistent, and makes
-   mistakes of their own.
-3. **v2 through the gate.** Pass or fail, both are results.
-4. **Minimal report evaluation** — 20 generated reports, checked for findings
-   invented outside the input list, with measured agreement against a human
-   pass on the same 20.
+Everything below needs the box. Nothing else is blocking. Rough total: about
+3.5 hours of GPU time plus whatever the first training run costs in debugging.
+
+**Step 1 — the headline benchmark (~36 min).** Both models over the pinned 604
+held-out studies. This is the comparison chapter's number *and* the baseline
+the gate measures against, so it has to exist before anything else.
+
+```bash
+DATA_DIR=/data HF_TOKEN=hf_… \
+OUTPUT_DIR=/path/to/cxr_gui/outputs/compare_test604 ./scripts/run_vast.sh
+```
+
+`SPLIT=test` and `N_IMAGES=604` are the defaults now. The list is already
+pinned, so `select` will reuse it. Copy the results into `cxr_gui/outputs/` and
+commit them — this repo's `outputs/` is gitignored. Decide *before looking* that
+604 is the headline and the 200-image run was preliminary.
+
+**Step 2 — predictions over validation (~20 min).** CURE only; MAIRA-2 is not
+needed here and doubles the cost for nothing.
+
+```bash
+DATA_DIR=/data SPLIT=validation N_IMAGES=455 MODELS=cure \
+OUTPUT_DIR=outputs/val455 ./scripts/run_vast.sh
+```
+
+**Step 3 — derive the corrections (seconds, no GPU).**
+
+```bash
+python3 scripts/simulate_corrections.py --run outputs/val455/per_model/cure.json \
+    --split validation --out exports/oracle_validation.jsonl
+```
+
+Read the summary table it prints before uploading. Roughly half of CURE's boxes
+should come back deleted; if that number is wildly different from the 45% seen
+on the 29-image sample, something is wrong with the run, not with the model.
+
+**Step 4 — upload and train.**
+
+```bash
+RX_AUTH_TOKEN=secret python3 serve.py --host 0.0.0.0 --port 8077 &
+curl -H "X-Auth-Token: secret" --data-binary @exports/oracle_validation.jsonl \
+     http://127.0.0.1:8077/corrections
+curl -H "X-Auth-Token: secret" http://127.0.0.1:8077/corrections/stats
+curl -H "X-Auth-Token: secret" -H "Content-Type: application/json" \
+     -d '{"dry_run": true}' http://127.0.0.1:8077/train      # walk it dry first
+curl -H "X-Auth-Token: secret" -H "Content-Type: application/json" \
+     -d '{"epochs": 1, "lr": 2e-5}' http://127.0.0.1:8077/train
+```
+
+The training loop has never executed. Expect the first attempt to fail on a
+shape or a dtype; that is debugging, not the experiment. Watch
+`GET /jobs/{id}` — it must report a non-zero trainable parameter count, or the
+adapter loaded frozen and the run is training nothing.
+
+**Step 5 — the gate (~26 min).** Score v2 over the same 604 images and compare.
+
+```bash
+curl -H "X-Auth-Token: secret" -H "Content-Type: application/json" \
+     -d '{"version": "v2"}' http://127.0.0.1:8077/evaluate
+```
+
+The pre-registered target: CURE-v1 sits at **0.210** F1@0.5 held-out, MAIRA-2 at
+**0.253**. Success is closing that 0.043 gap. Write the target down before
+running and report whatever comes out.
+
+**A learning curve beats a single number.** Train separate versions on the
+first 50, 150, 300 and all 455 corrections and score each. Even a flat line is
+a finding — "correction volume at this scale does not move a 4B grounded
+model" — and it costs four training runs rather than one.
+
+**Stopping rule, fixed now:** if the first clean run does not move F1, write it
+up. Do not spend weeks on hyperparameters. The thesis contribution is the
+closed loop with an evaluation gate, not the number that comes out of it.
+
+**Step 6 — report evaluation (no GPU).** 20 generated reports, checked for
+findings invented outside the input list, with agreement measured against your
+own pass on the same 20. Needs the OpenAI key in the desktop app.
 
 ---
 
