@@ -98,8 +98,12 @@ case "$OUTPUT_DIR" in
 esac
 
 # 1. Sanity checks ----------------------------------------------------------
-if [ -z "${HF_TOKEN:-}" ] && [ -z "${HUGGING_FACE_HUB_TOKEN:-}" ]; then
-    echo "[ERROR] HF_TOKEN is not set. Run:  export HF_TOKEN=hf_xxx"
+# A stored `hf auth login` counts: huggingface_hub reads that file itself, and
+# it keeps the token out of shell history, env dumps and job logs.
+HF_TOKEN_FILE="${HF_HOME:-$HOME/.cache/huggingface}/token"
+if [ -z "${HF_TOKEN:-}" ] && [ -z "${HUGGING_FACE_HUB_TOKEN:-}" ] && [ ! -s "$HF_TOKEN_FILE" ]; then
+    echo "[ERROR] No Hugging Face credentials. Either run:  hf auth login"
+    echo "        or:  export HF_TOKEN=hf_xxx"
     echo "        (needed for gated MAIRA-2, MedGemma-4B base, and the CURE adapter)"
     exit 1
 fi
