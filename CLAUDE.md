@@ -128,6 +128,30 @@ tree, or copy results across afterwards, and commit them. `RX/outputs/` also
 holds a working copy of the runs — convenient on the GPU box, but it is
 gitignored, so never treat it as the record.
 
+### Headline run (`../cxr_gui/outputs/compare_test604/`) — quote this one
+
+**604 held-out test studies** (every test-split image with GT boxes), seed 42,
+RTX 4090 48 GB, bf16, 2026-09-17, commit `ac788aa`, torch 2.11.0+cu128. This is
+the comparison chapter's number and the baseline the gate measures against; the
+200-image run above is preliminary and superseded.
+
+| model | mean IoU (micro) | F1@0.5 | precision@0.5 | recall@0.5 | mAP-like | halluc@0.5 | pred boxes | s/img | n |
+|---|---|---|---|---|---|---|---|---|---|
+| CURE v1 | 0.416 | 0.2226 | 0.246 | 0.203 | 0.085 | 0.754 | 1255 | 4.6 | 604 |
+| MAIRA-2 | 0.440 | 0.2379 | 0.258 | 0.221 | 0.100 | 0.742 | 1304 | 1.2 | 604 |
+
+Same direction as the 200-image run, **smaller margin**: MAIRA-2 +0.015 F1@0.5,
+not +0.043. Do not quote the 0.210 / 0.253 pair as the headline any more.
+
+**MAIRA-2 scored 0.251 until its failures were fixed, and that difference is
+entirely selection.** 10 of 604 generations hit `max_new_tokens=450` inside a
+grounded phrase; the unclosed `<obj>` made MAIRA-2's own parser assert, the
+images were dropped, and the model was being scored on the 594 it happened to
+finish. `_parse_maira2_output` now keeps every complete phrase and discards
+only the truncated tail, and `RETRY_ERRORS=1` re-runs just the failed images.
+**Never report a model on fewer images than its comparator** — dropping the
+hardest 2% flattered MAIRA-2 by 0.013 F1.
+
 ### The oracle reviewer (`scripts/simulate_corrections.py`)
 
 Turns a finished prediction run plus PadChest-GR ground truth into the same
@@ -160,10 +184,18 @@ the model to stop saying "no pleural effusion". `--fix drop-negations` already
 measured that behaviour as a keyword-F1 loss. A reviewer corrects boxes, not
 prose.
 
-Validated on the 29 validation images inside the leaked run: 28 findings
-accepted as-is, 21 boxes moved, 17 keywords replaced, 40 deleted, 55 added, and
-all 29 examples pass `rxapi.dataset.validate`. **45% of CURE's predicted boxes
-had no ground-truth match at IoU 0.3** — a number worth quoting on its own.
+Run over the full validation split (2026-09-17): **308 studies** — not 455;
+only 308 validation images carry GT boxes, and `select_images` takes only
+those. 934 predicted boxes: 310 accepted as-is, 251 moved to GT, 185 keywords
+replaced, 373 deleted, 770 missed boxes added. **40% of CURE's predicted boxes
+had no ground-truth match at IoU 0.3** — a number worth quoting on its own (the
+29-image pilot said 45%).
+
+**The target must be written the way CURE writes**, i.e. every box of a finding
+on one sentence — `Prominent vascular hila [b1] [b2]` — never the same sentence
+repeated per box. The first version repeated it, and a pilot trained on that
+output cut recall from 0.33 to 0.17 and taught the model a stock opening
+sentence. `build_target` groups by keyword in order of first appearance.
 
 Say *oracle reviewer* in writing, never "radiologist corrections": it sees every
 error, never disagrees with itself, and never makes a mistake of its own, so
@@ -183,40 +215,81 @@ needs the model.
 
 ---
 
-## Where we are (2026-09-06)
+## Where we are (2026-09-17) — the loop has been run end to end
 
-Done: the benchmark twice (leaked run, then the clean 200-image test-split
-run), `SPLIT` support through selection / re-scoring / `run_vast.sh`, three
-post-processing rules measured and all rejected, `rxapi/` written with its code
-paths tested (training only as `dry_run`), the 604-image evaluation list
-pinned, and the oracle reviewer built and validated.
+The GPU session is done. `cxr_gui/outputs/cl_oracle_run_2026-09-17/` holds the
+whole record: validation predictions, the 308 oracle corrections, the registry,
+every job log, and each version's gate verdict plus its 604-image predictions.
+Adapter v3 (the best) is at `~/cxr_models/rx_adapters/v3` on the review Mac,
+nowhere else — the rented box was destroyed.
 
-**Everything that can be done without a GPU is done.** The next three steps all
-need the box.
+### The learning curve — every point trained from v1, gated on the 604 images
 
-Decided:
+| version | corrections | replay | F1@0.5 | precision | recall | halluc | pred boxes | kw F1 (micro) | gate |
+|---|---|---|---|---|---|---|---|---|---|
+| v1 | — | — | 0.2226 | 0.246 | 0.203 | 0.754 | 1255 | 0.175 | baseline |
+| v2 | 50 | 150 | 0.2205 | 0.279 | 0.182 | 0.721 | 992 | 0.198 | pass |
+| **v3** | 150 | 450 | **0.2321** | 0.271 | 0.203 | 0.729 | 1142 | 0.130 | pass |
+| v4 | 300 | 900 | 0.2318 | 0.260 | 0.209 | 0.740 | 1223 | 0.069 | pass |
+| v5 | 308 | 924 | 0.2228 | 0.292 | 0.180 | 0.708 | 939 | 0.095 | pass |
 
-- **CURE only.** MAIRA-2 stays a comparator, not a second product. CURE is a
-  LoRA adapter on an open base and is the only one of the two that can actually
-  be iterated on; MAIRA-2 is a 7B model under a restrictive research licence.
-  Say plainly in the thesis that CURE scores lower on held-out data and that
-  this is an engineering choice, not a performance claim.
-- **Corrections come from the validation split** — never train (already seen by
-  CURE) and never test (the measuring stick). 455 studies: enough for the
-  100-case threshold and for a 50/150/300/455 learning curve.
-- **Pre-registered target.** CURE-v1 scores 0.210 F1@0.5 held-out, MAIRA-2
-  0.253. Success is closing that 0.043 gap. Write the target down before
-  running and report whatever comes out.
+Per-image paired bootstrap vs v1 is **positive and significant at every point**
+for IoU, F1@0.5 and keyword F1 (v3: IoU +0.038 [0.020, 0.057], F1 +0.031
+[0.008, 0.056]). The aggregate moves much less than the per-image mean, because
+micro pooling weights images with many findings.
 
-Expect a null result: 455 examples against the tens of thousands CURE was
-trained on, from the same distribution, against errors already shown not to be
-systematic. Design for that — the oracle framing turns a null into an **upper
-bound** ("even with noise-free corrections at this volume, no measurable
-gain"), which is stronger than a null from noisy human corrections. Fix a
-stopping rule now: if the first clean run does not move F1, write it up rather
-than chasing hyperparameters.
+**What to claim.**
 
----
+- **The loop works and the gate works.** Corrections → training → an adoption
+  gate on held-out data, with every candidate measured before it can be served.
+  That is the contribution; the numbers are the evidence it functions.
+- **The pre-registered target was not met.** Closing the CURE→MAIRA-2 gap was
+  the stated goal; v3 closes about 60% of the (now smaller) 0.015 gap and no
+  version passes MAIRA-2. Report that plainly.
+- **The consistent effect is precision, not F1.** Every version hallucinates
+  less than v1 (down to 0.708) and predicts fewer, better boxes. The oracle
+  deletes 40% of CURE's boxes, so it teaches caution — and caution is exactly
+  what a reviewer-corrected model should learn.
+- **More corrections is not monotonically better.** F1 peaks at 150 and falls
+  back by 308 as recall drops. An oracle at this volume moves the operating
+  point, it does not add capability.
+- **Aggregate keyword F1 collapses (0.175 → 0.069 at v4) while per-image
+  keyword F1 rises.** Not a scoring bug: the trained versions write far longer
+  reports (mean 140 → 478 characters) with many more unmatched keywords
+  (FP 1322 → 7446, TP 295 → 331). The oracle adds 770 missed findings, and the
+  model learns to say more. Box metrics are unaffected — the extra sentences
+  mostly carry no box. Worth one paragraph in the write-up.
+
+### What the first real run cost — bugs the pilot caught
+
+A 20-image / 30-correction pilot was run before the full one. It paid for
+itself several times over; do the same before any future full run.
+
+| commit | bug |
+|---|---|
+| `8d93c08` | the gate read the pinned list from `pinned["images"]`; the key is `selected`, so `/evaluate` iterated the dict's field names |
+| `0b02466` | `run_vast.sh` ran `select` with the template python, which has no `cv2` |
+| `3b3d25d` | `setup_hf_auth()` called interactive `login()` and ignored a stored `hf auth login` |
+| `717f02c` | `DEVICE` defaulted to `cpu`; the API server exports nothing, so `/train/smoke` refused on a 48 GB GPU |
+| `526c6d0` | `build_keyword_findings(pred, orig_size)` — missing `box_format`, so **every** `CureService.detect` raised, the gate scored v2 on 0 images and called it a total regression. The same call is what the desktop app's `RemoteEngine` uses |
+| `a0eb02b` | training targets repeated a sentence per box, and replay drew normal studies that neither the corrections nor the benchmark contain |
+| `ac788aa` | MAIRA-2 truncated-output failures dropped 10 images |
+
+**The gate is only as trustworthy as its parity with the benchmark.** After
+`526c6d0`, v1 was re-scored *through the gate* and reproduced
+`compare_test604` exactly — 20/20 identical `report_text`, all deltas 0.0000.
+Do that check again after any change to `inference.py` or `compare_models.py`;
+a gate that cannot reproduce its own baseline can only mislead.
+
+### Decided (unchanged)
+
+- **CURE only.** MAIRA-2 stays a comparator. CURE is a LoRA adapter on an open
+  base and the only one of the two that can be iterated on; say plainly that it
+  scores lower on held-out data and that this is an engineering choice.
+- **Corrections come from validation**, never train (seen by CURE) and never
+  test (the measuring stick).
+- **Stopping rule, honoured:** the first clean run did not close the gap, so it
+  gets written up. No hyperparameter search.
 
 ## The server API (`rxapi/`)
 
@@ -267,6 +340,16 @@ PadChest-GR examples, rebuilt into CURE's own output format so a replay example
 and a correction are indistinguishable to the trainer. Without this, a hundred
 corrections overwrite what the adapter learned from thousands of cases.
 
+**Replay draws train-split studies that have GT boxes — the same population as
+the corrections and the benchmark.** Replaying normal studies ("No significant
+findings", which `select_images` never picks) pulled a pilot towards saying
+nothing: recall 0.33 → 0.17. The pool is 2096 studies, all of which must be on
+disk.
+
+**Targets are written the way CURE writes.** One sentence carries all of its
+boxes. See the oracle section — this is the single change that turned a broken
+pilot into a healthy one.
+
 **Train on `train`, evaluate on `test`.** Now that the leakage is known this is
 not optional. `evaluation.run_version()` scores against the pinned list; point
 it at the test-split list.
@@ -274,93 +357,67 @@ it at the test-split list.
 **Training needs CUDA.** `_run_training` refuses on MPS or CPU — a 4B VLM in
 bf16 with optimizer state does not fit in 24 GB of unified memory.
 
-**The training loop has never been executed.** It is written and its code path
-is exercised by `dry_run=true` (dataset assembly, version naming, registry
-write, no torch). Treat the first real run as debugging, not as an experiment.
+**The loop has been executed** (2026-09-17): smoke test, four training runs and
+four gates, all on a 4090 48 GB, peak 36.9 GB with 1.38 B trainable parameters
+(the LoRA tensors plus `modules_to_save`, held in fp32 under bf16 autocast).
+`dry_run=true` still walks dataset assembly, version naming and the registry
+write without torch — use it to check what a run *would* train on.
+
+**`unload()` frees CUDA memory** (`gc` + `empty_cache`). Evaluation and
+training both load a full copy; without it the second load meets a GPU that is
+still holding the first.
 
 ---
 
-## What is next — the GPU session, in order
+## Re-running the loop on a rented box
 
-Everything below needs the box. Nothing else is blocking. Rough total: about
-3.5 hours of GPU time plus whatever the first training run costs in debugging.
+This was run on 2026-09-17 (vast.ai RTX 4090 48 GB, ~6 h). `full.sh` and
+`loop.sh` from that session are not in the repo — they are three-line wrappers
+around what follows, and each stage skips if its output already exists, which
+is what makes the run survive an instance stop.
 
-**Step 1 — the headline benchmark (~36 min).** Both models over the pinned 604
-held-out studies. This is the comparison chapter's number *and* the baseline
-the gate measures against, so it has to exist before anything else.
-
-```bash
-DATA_DIR=/data HF_TOKEN=hf_… \
-OUTPUT_DIR=/path/to/cxr_gui/outputs/compare_test604 ./scripts/run_vast.sh
-```
-
-`SPLIT=test` and `N_IMAGES=604` are the defaults now. The list is already
-pinned, so `select` will reuse it. Copy the results into `cxr_gui/outputs/` and
-commit them — this repo's `outputs/` is gitignored. Decide *before looking* that
-604 is the headline and the 200-image run was preliminary.
-
-**Step 2 — predictions over validation (~20 min).** CURE only; MAIRA-2 is not
-needed here and doubles the cost for nothing.
+**Prepare.** Dataset at `/data` (`grounded_reports_20240819.json`,
+`master_table.csv`, `Padchest_GR_files/`). Replay needs **every train-split
+study with GT boxes** on disk — 2096 of them; with fewer, `replay_examples`
+refuses rather than silently shrinking the pool. Store the HF token with
+`hf auth login` (never `export HF_TOKEN`, which the API server does not see).
 
 ```bash
-DATA_DIR=/data SPLIT=validation N_IMAGES=455 MODELS=cure \
-OUTPUT_DIR=outputs/val455 ./scripts/run_vast.sh
-```
-
-**Step 3 — derive the corrections (seconds, no GPU).**
-
-```bash
+# 1. headline benchmark (~1 h)   both models, 604 test studies
+DATA_DIR=/data OUTPUT_DIR=…/cxr_gui/outputs/compare_test604 ./scripts/run_vast.sh
+# 2. validation predictions (~25 min)   CURE only
+DATA_DIR=/data SPLIT=validation N_IMAGES=455 MODELS=cure OUTPUT_DIR=outputs/val455 ./scripts/run_vast.sh
+# 3. oracle corrections (seconds, no GPU)
 python3 scripts/simulate_corrections.py --run outputs/val455/per_model/cure.json \
     --split validation --out exports/oracle_validation.jsonl
+# 4. serve, upload, smoke, then one train+gate per curve point
+RX_VAR=/workspace/rxvar OUTPUT_DIR=…/compare_test604 RX_AUTH_TOKEN=$T python3 serve.py --port 8077 &
+curl -H "X-Auth-Token: $T" --data-binary @exports/oracle_validation.jsonl :8077/corrections
+curl -H "X-Auth-Token: $T" -H 'Content-Type: application/json' -d '{"steps":30}' :8077/train/smoke
+curl … -d '{"epochs":1,"lr":2e-5,"force":true,"parent_version":"v1","max_corrections":150,"seed":0}' :8077/train
+curl … -d '{"version":"v3"}' :8077/evaluate
 ```
 
-Read the summary table it prints before uploading. Roughly half of CURE's boxes
-should come back deleted; if that number is wildly different from the 45% seen
-on the 29-image sample, something is wrong with the run, not with the model.
+**Always `parent_version: "v1"`** on a curve point, or "300 corrections"
+secretly means 150 then 300. **Always the smoke test first**: 30 steps on one
+example must drive the loss to ~0 (it went 4.8 → 0.0000, weights moved 5.6e-2,
+peak 37 GB). A trainer that cannot memorise one example turns a real run into a
+null result that looks like a finding.
 
-**Step 4 — upload and train.**
+**Timings on a 4090 48 GB.** Benchmark 604 × 2 models ≈ 1 h; validation 308 ≈
+25 min; training ≈ 1.2 s/step (150 corrections + 450 replay = 600 steps ≈
+12 min; 308 + 924 = 1232 steps ≈ 26 min); **each gate ≈ 40–90 min**, and it
+grows with the version — trained models write longer reports (v4 8.9 s/img vs
+v1 4.6). Four curve points cost more in gating than in training.
 
-```bash
-RX_AUTH_TOKEN=secret python3 serve.py --host 0.0.0.0 --port 8077 &
-curl -H "X-Auth-Token: secret" --data-binary @exports/oracle_validation.jsonl \
-     http://127.0.0.1:8077/corrections
-curl -H "X-Auth-Token: secret" http://127.0.0.1:8077/corrections/stats
-curl -H "X-Auth-Token: secret" -H "Content-Type: application/json" \
-     -d '{"dry_run": true}' http://127.0.0.1:8077/train      # walk it dry first
-curl -H "X-Auth-Token: secret" -H "Content-Type: application/json" \
-     -d '{"epochs": 1, "lr": 2e-5}' http://127.0.0.1:8077/train
-```
+**A pilot first, always.** 20 test images + 30 validation corrections is ~25
+minutes and caught seven bugs (table above), including one that made every
+prediction fail and one that halved recall.
 
-The training loop has never executed. Expect the first attempt to fail on a
-shape or a dtype; that is debugging, not the experiment. Watch
-`GET /jobs/{id}` — it must report a non-zero trainable parameter count, or the
-adapter loaded frozen and the run is training nothing.
-
-**Step 5 — the gate (~26 min).** Score v2 over the same 604 images and compare.
-
-```bash
-curl -H "X-Auth-Token: secret" -H "Content-Type: application/json" \
-     -d '{"version": "v2"}' http://127.0.0.1:8077/evaluate
-```
-
-The pre-registered target: CURE-v1 sits at **0.210** F1@0.5 held-out, MAIRA-2 at
-**0.253**. Success is closing that 0.043 gap. Write the target down before
-running and report whatever comes out.
-
-**A learning curve beats a single number.** Train separate versions on the
-first 50, 150, 300 and all 455 corrections and score each. Even a flat line is
-a finding — "correction volume at this scale does not move a 4B grounded
-model" — and it costs four training runs rather than one.
-
-**Stopping rule, fixed now:** if the first clean run does not move F1, write it
-up. Do not spend weeks on hyperparameters. The thesis contribution is the
-closed loop with an evaluation gate, not the number that comes out of it.
-
-**Step 6 — report evaluation (no GPU).** 20 generated reports, checked for
+**Step 6 — report evaluation (no GPU).** 20 generated reports checked for
 findings invented outside the input list, with agreement measured against your
-own pass on the same 20. Needs the OpenAI key in the desktop app.
-
----
+own pass on the same 20. Needs a fresh OpenAI key in the desktop app. Still to
+do.
 
 ## Environment notes
 
