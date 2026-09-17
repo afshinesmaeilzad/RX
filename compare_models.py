@@ -757,6 +757,28 @@ def load_maira2_model(cfg: DeviceConfig) -> tuple[Any, Any]:
     return model, processor
 
 
+def _parse_maira2_output(processor: Any, text: str) -> Any:
+    """MAIRA-2's own parser, tolerant of an output cut off mid-phrase.
+
+    When generation hits max_new_tokens inside a grounded phrase the text ends
+    with an unclosed `<obj>`, and the official parser asserts on the whole
+    report. 10 of 604 test images failed that way and were dropped, leaving
+    MAIRA-2 scored on fewer images than CURE. Keep every complete phrase and
+    discard only the truncated tail.
+    """
+    start = processor.phrase_start_token
+    while True:
+        try:
+            return processor.convert_output_to_plaintext_or_grounded_sequence(text)
+        except AssertionError:
+            cut = text.rfind(start)
+            if cut <= 0:
+                raise
+            print(f"[maira2] truncated grounded output; dropped {len(text) - cut} "
+                  "trailing characters")
+            text = text[:cut].rstrip()
+
+
 def infer_maira2(sample: ImageSample, model: Any, processor: Any) -> ModelRunResult:
     t0 = time.time()
     processed_inputs = processor.format_and_preprocess_reporting_input(
@@ -785,7 +807,7 @@ def infer_maira2(sample: ImageSample, model: Any, processor: Any) -> ModelRunRes
         skip_special_tokens=True,
     ).lstrip()
 
-    parsed = processor.convert_output_to_plaintext_or_grounded_sequence(raw_prediction)
+    parsed = _parse_maira2_output(processor, raw_prediction)
     pred_findings: list[dict[str, Any]] = []
 
     if isinstance(parsed, list):
@@ -1509,7 +1531,20 @@ def cmd_run(args: argparse.Namespace) -> None:
         if save_figures:
             os.makedirs(fig_dir, exist_ok=True)
 
+        # RETRY_ERRORS=1 re-runs only the images whose stored result is an error
+        # and keeps every other result as it is.
+        out_path = os.path.join(PER_MODEL_DIR, f"{model_key}.json")
+        if os.environ.get("RETRY_ERRORS") == "1" and os.path.exists(out_path):
+            with open(out_path, "r", encoding="utf-8") as f:
+                per_image.update(json.load(f)["per_image"])
+            retry = {i for i, p in per_image.items() if p.get("error")}
+            print(f"RETRY_ERRORS: re-running {len(retry)} failed image(s)")
+        else:
+            retry = None
+
         for idx, image_id in enumerate(selected, start=1):
+            if retry is not None and image_id not in retry:
+                continue
             try:
                 sample = build_sample(image_id, gt_by_id, which=model_key)
                 result = infer_fn(sample, model, processor)
@@ -1547,7 +1582,6 @@ def cmd_run(args: argparse.Namespace) -> None:
             "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "per_image": per_image,
         }
-        out_path = os.path.join(PER_MODEL_DIR, f"{model_key}.json")
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(out, f, indent=2, ensure_ascii=False)
         print(f"Saved {out_path}")
