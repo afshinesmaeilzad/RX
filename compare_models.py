@@ -239,7 +239,10 @@ def setup_hf_auth() -> None:
 
 def resolve_device_config() -> DeviceConfig:
     """bf16 full precision only. No quantization."""
-    requested = os.environ.get("DEVICE", os.environ.get("CURE_DEVICE", "cpu")).lower()
+    requested = os.environ.get("DEVICE", os.environ.get("CURE_DEVICE", "auto")).lower()
+    if requested == "auto":
+        # The API server does not export DEVICE; without this it trained on CPU.
+        requested = "cuda" if torch.cuda.is_available() else "cpu"
 
     if requested == "cuda" and torch.cuda.is_available():
         device = torch.device("cuda")
