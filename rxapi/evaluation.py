@@ -183,6 +183,14 @@ def run_version(log: Callable[[str], None], version: str,
             log(f"{i}/{len(image_ids)} images")
 
     service.unload()
+    failed = [i for i, e in per_image.items() if e.get("error")]
+    if per_image and len(failed) == len(per_image):
+        raise RuntimeError(
+            f"every prediction failed ({per_image[failed[0]]['error']}); not "
+            "writing an evaluation that would score as a total regression"
+        )
+    if failed:
+        log(f"{len(failed)} of {len(per_image)} image(s) failed")
     out_path = config.VAR_DIR / "evals" / f"{version}.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(

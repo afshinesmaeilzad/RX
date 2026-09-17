@@ -106,6 +106,15 @@ class CureService:
     def unload(self) -> None:
         self.model = self.processor = None
         self.version = None
+        # Evaluation unloads before training loads a second copy on one GPU.
+        import gc
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
 
     # --------------------------------------------------------------- detect
     def detect(self, image_path: str, max_new_tokens: int | None = None) -> dict[str, Any]:
@@ -126,7 +135,7 @@ class CureService:
             )
 
         pred = cm.parse_grounded_report_cxcywh(text)
-        findings = cm.build_keyword_findings(pred, orig_size)
+        findings = cm.build_keyword_findings(pred, "cxcywh", orig_size)
         return {
             "model": "cure",
             "device": self.device,
