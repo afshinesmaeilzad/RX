@@ -51,7 +51,7 @@ def _headline(metrics: dict[str, Any]) -> dict[str, float]:
     }
 
 
-def score_run(run_path: Path) -> dict[str, Any]:
+def score_run(run_path: Path, keep_ids: set[str] | None = None) -> dict[str, Any]:
     """Aggregate a stored run (predictions already generated) — no GPU."""
     import compare_models as cm
 
@@ -59,6 +59,8 @@ def score_run(run_path: Path) -> dict[str, Any]:
     gt = _load_gt()
     per_image = {}
     for image_id, payload in run["per_image"].items():
+        if keep_ids is not None and image_id not in keep_ids:
+            continue
         if payload.get("error"):
             per_image[image_id] = payload
             continue
@@ -83,8 +85,12 @@ def compare(candidate_run: Path,
     """Candidate vs baseline on the same images, with significance."""
     import compare_models as cm
 
-    base = score_run(baseline_run)
-    cand = score_run(candidate_run)
+    # Score both on the images they share. A candidate generated with `limit`
+    # covers a prefix of the list; against the full baseline the headline
+    # deltas would compare different image sets.
+    cand_ids = set(json.loads(Path(candidate_run).read_text())["per_image"])
+    base = score_run(baseline_run, keep_ids=cand_ids)
+    cand = score_run(candidate_run, keep_ids=cand_ids)
     base_head, cand_head = _headline(base), _headline(cand)
 
     deltas = {
@@ -134,7 +140,13 @@ def run_version(log: Callable[[str], None], version: str,
             "scored on exactly the images the baseline used."
         )
     pinned = json.loads(image_list_path.read_text())
-    image_ids = pinned["images"] if isinstance(pinned, dict) and "images" in pinned else pinned
+    # compare_models.py writes {seed, n_images, split, selected, ...}.
+    if isinstance(pinned, dict):
+        image_ids = pinned.get("selected") or []
+    else:
+        image_ids = list(pinned)
+    if not image_ids:
+        raise RuntimeError(f"{image_list_path} lists no images")
     if limit:
         image_ids = image_ids[:limit]
 
