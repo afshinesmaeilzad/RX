@@ -147,7 +147,16 @@ want_model () { case ",$MODELS," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
 # 3. Select the shared image list (once) ------------------------------------
 echo ""
 echo "== Selecting image list (N_IMAGES=$N_IMAGES, split=${SPLIT:-all}, seed=$SHUFFLE_SEED) =="
-"$PYTHON" compare_models.py select
+# compare_models.py imports cv2 and matplotlib at module level; the template's
+# base python has neither. Select with a model venv, building it first if needed.
+if want_model cure; then
+    make_venv "$VENV_CURE" requirements-cure.txt
+    SELECT_PY="$VENV_CURE/bin/python"
+else
+    make_venv "$VENV_MAIRA" requirements-maira2.txt
+    SELECT_PY="$VENV_MAIRA/bin/python"
+fi
+"$SELECT_PY" compare_models.py select
 
 # 4. MAIRA-2 -----------------------------------------------------------------
 if want_model maira2; then
