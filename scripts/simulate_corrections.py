@@ -111,13 +111,23 @@ def cxcywh_str(box_norm: list[float]) -> str:
 
 def build_target(entries: list[dict[str, Any]]) -> str:
     """The corrected report, in the format CURE itself emits."""
-    sentences = []
+    # CURE attaches every box of a finding to one sentence —
+    # "Prominent vascular hila [b1] [b2]" — never "hila [b1]. hila [b2]". The
+    # first oracle repeated the sentence per box, and a pilot run trained on it
+    # halved recall. Group by keyword, in order of first appearance.
+    order: list[str] = []
+    boxes: dict[str, list[str]] = {}
     for entry in entries:
         keyword = (entry.get("keyword") or "").strip().rstrip(".")
         if not keyword:
             continue
+        if keyword not in boxes:
+            order.append(keyword)
+            boxes[keyword] = []
         box = entry.get("box_norm")
-        sentences.append(f"{keyword} {cxcywh_str(box)}" if box else keyword)
+        if box:
+            boxes[keyword].append(cxcywh_str(box))
+    sentences = [" ".join([k, *boxes[k]]) for k in order]
     if not sentences:
         return "No relevant findings"
     return ". ".join(sentences) + "."

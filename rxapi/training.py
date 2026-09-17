@@ -93,6 +93,11 @@ def replay_examples(n: int, exclude: set[str], seed: int = 0) -> list[dict[str, 
         image_id = record.get("ImageID")
         if not image_id or image_id in exclude or splits.get(image_id) != "train":
             continue
+        # Same population as the corrections and the benchmark: studies with at
+        # least one GT box (compare_models.select_images). Replaying normal
+        # studies too pulled a pilot run towards "No significant findings".
+        if not any(f.get("boxes") for f in record.get("findings") or []):
+            continue
         path = images_dir / image_id
         if not path.is_file():
             continue
@@ -101,15 +106,12 @@ def replay_examples(n: int, exclude: set[str], seed: int = 0) -> list[dict[str, 
             sentence = (finding.get("sentence_en") or "").strip().rstrip(".")
             if not sentence:
                 continue
-            boxes = finding.get("boxes") or []
-            if boxes:
-                for x1, y1, x2, y2 in boxes:
-                    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-                    sentences.append(
-                        f"{sentence} [{cx:.2f},{cy:.2f},{x2 - x1:.2f},{y2 - y1:.2f}]"
-                    )
-            else:
-                sentences.append(sentence)
+            # All of a finding's boxes on its one sentence, as CURE writes them.
+            box_strs = [
+                f"[{(x1 + x2) / 2:.2f},{(y1 + y2) / 2:.2f},{x2 - x1:.2f},{y2 - y1:.2f}]"
+                for x1, y1, x2, y2 in finding.get("boxes") or []
+            ]
+            sentences.append(" ".join([sentence, *box_strs]))
         if not sentences:
             continue
         pool.append({
