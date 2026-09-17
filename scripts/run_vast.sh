@@ -56,7 +56,16 @@ MODELS="${MODELS:-cure,maira2}"
 VENV_MAIRA=".venv-maira2"
 VENV_CURE=".venv-cure"
 
-if command -v python3 >/dev/null 2>&1; then
+# The base interpreter decides which torch every venv inherits through
+# --system-site-packages. Vast's PyTorch template ships its CUDA torch in
+# /venv/main, NOT in the system python3 on PATH — picking python3 there makes
+# make_venv download a different torch from the cu124 index, which costs
+# minutes and silently changes the torch version between benchmark runs.
+if [ -n "${PYTHON:-}" ]; then
+    :                                            # explicit override wins
+elif [ -x /venv/main/bin/python ] && /venv/main/bin/python -c "import torch" 2>/dev/null; then
+    PYTHON=/venv/main/bin/python
+elif command -v python3 >/dev/null 2>&1; then
     PYTHON=python3
 elif command -v python >/dev/null 2>&1; then
     PYTHON=python
@@ -64,6 +73,8 @@ else
     echo "[ERROR] python3 not found. Use a PyTorch template."
     exit 1
 fi
+echo "base python: $PYTHON ($("$PYTHON" -c 'import sys; print(sys.version.split()[0])' 2>/dev/null)," \
+     "torch $("$PYTHON" -c 'import torch; print(torch.__version__)' 2>/dev/null || echo none))"
 
 echo "=================================================="
 echo " RX CXR comparison — CURE vs MAIRA-2 (bf16, Vast.ai)"
