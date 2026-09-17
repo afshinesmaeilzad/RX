@@ -226,9 +226,13 @@ class ModelRunResult:
 def setup_hf_auth() -> None:
     from huggingface_hub import login
 
+    from huggingface_hub import get_token
+
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     if token:
         login(token=token)
+    elif get_token():
+        return          # a stored `hf auth login`; huggingface_hub reads it itself
     else:
         login()
 
