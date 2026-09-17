@@ -191,6 +191,27 @@ def activate_version(version: str, force: bool = Body(default=False, embed=True)
 # --------------------------------------------------------------------------
 
 
+@app.post("/train/smoke", dependencies=[Auth])
+def start_smoke_test(
+    steps: int = Body(default=30, embed=True),
+    lr: float = Body(default=1e-4, embed=True),
+    parent_version: str | None = Body(default=None, embed=True),
+) -> dict[str, Any]:
+    """Overfit one example. Run this before any real training.
+
+    A trainer that cannot memorise one example is broken, and a real run from
+    it would be scored — wrongly — as a null result. Saves nothing.
+    """
+    def work(log, record):
+        return training.smoke_test(log, steps=steps, lr=lr,
+                                   parent_version=parent_version)
+
+    try:
+        return jobs.submit("smoke", {"steps": steps, "lr": lr}, work)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @app.post("/train", dependencies=[Auth])
 def start_training(
     epochs: int = Body(default=1, embed=True),
@@ -199,6 +220,9 @@ def start_training(
     include_all: bool = Body(default=False, embed=True),
     force: bool = Body(default=False, embed=True),
     dry_run: bool = Body(default=False, embed=True),
+    max_corrections: int | None = Body(default=None, embed=True),
+    parent_version: str | None = Body(default=None, embed=True),
+    seed: int = Body(default=0, embed=True),
 ) -> dict[str, Any]:
     """Continue the active adapter on the pending corrections.
 
@@ -218,12 +242,16 @@ def start_training(
         return training.train(
             log, epochs=epochs, lr=lr, replay_ratio=replay_ratio,
             include_all=include_all, force=force or dry_run, dry_run=dry_run,
-            job_id=record["job_id"],
+            max_corrections=max_corrections, parent_version=parent_version,
+            seed=seed, job_id=record["job_id"],
         )
 
     try:
-        return jobs.submit("train", {"epochs": epochs, "lr": lr,
-                                     "dry_run": dry_run}, work)
+        return jobs.submit("train", {
+            "epochs": epochs, "lr": lr, "dry_run": dry_run,
+            "max_corrections": max_corrections, "parent_version": parent_version,
+            "seed": seed,
+        }, work)
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
