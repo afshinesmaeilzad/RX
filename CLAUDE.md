@@ -444,10 +444,11 @@ v1 4.6). Four curve points cost more in gating than in training.
 minutes and caught seven bugs (table above), including one that made every
 prediction fail and one that halved recall.
 
-**Step 6 — report evaluation (no GPU).** 20 generated reports checked for
-findings invented outside the input list, with agreement measured against your
-own pass on the same 20. Needs a fresh OpenAI key in the desktop app. Still to
-do.
+**Step 6 — report evaluation (no GPU).** Done on the app side:
+`cxr_gui/scripts/eval_reports.py`, results in `cxr_gui/outputs/report_eval/`.
+Automatic judge: 2 of 70 clinical claims unsupported (1 of 20 reports). The
+manual pass on the blind `review_sheet.csv` and the κ between the two are the
+remaining part — see `cxr_gui/CLAUDE.md`.
 
 ## Environment notes
 
