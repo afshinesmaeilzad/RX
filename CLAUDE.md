@@ -444,11 +444,12 @@ v1 4.6). Four curve points cost more in gating than in training.
 minutes and caught seven bugs (table above), including one that made every
 prediction fail and one that halved recall.
 
-**Step 6 — report evaluation (no GPU).** Done on the app side:
+**Report check (no GPU) — exploratory, non-clinical.** Lives on the app side:
 `cxr_gui/scripts/eval_reports.py`, results in `cxr_gui/outputs/report_eval/`.
-Automatic judge: 2 of 70 clinical claims unsupported (1 of 20 reports). The
-manual pass on the blind `review_sheet.csv` and the κ between the two are the
-remaining part — see `cxr_gui/CLAUDE.md`.
+A language-model judge flagged 2 of 70 clinical claims (1 of 20 reports) as
+not supported by the input list. It is **not clinical validation**: no
+clinician reads, labels or corrects report text in this project, and none is
+planned. See `cxr_gui/CLAUDE.md` for how it may be stated.
 
 ## Environment notes
 
