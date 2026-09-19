@@ -260,6 +260,36 @@ micro pooling weights images with many findings.
   model learns to say more. Box metrics are unaffected — the extra sentences
   mostly carry no box. Worth one paragraph in the write-up.
 
+### Against MAIRA-2 — the gap closes (`scripts/compare_versions.py`)
+
+Paired bootstrap, version − MAIRA-2, per image over all 604 test studies. Uses
+the stored per-image payloads (no re-parsing: MAIRA-2 is xyxy, CURE cxcywh) and
+refuses to report unless it reproduces every published F1@0.5 to four decimals.
+Output: `cxr_gui/outputs/cl_oracle_run_2026-09-17/vs_maira2.{md,json}`.
+
+| version | Δ F1@0.5 [95% CI] | p | Δ IoU [95% CI] | p | Δ keyword F1 [95% CI] | p |
+|---|---|---|---|---|---|---|
+| v1 | −0.031 [−0.056, −0.005] | **0.017** | −0.017 [−0.038, +0.003] | 0.103 | −0.056 [−0.077, −0.035] | **<0.001** |
+| v2 | −0.021 [−0.047, +0.003] | 0.089 | −0.004 [−0.025, +0.018] | 0.731 | −0.027 [−0.050, −0.005] | **0.011** |
+| **v3** | **+0.001 [−0.027, +0.028]** | **0.997** | +0.021 [−0.001, +0.041] | 0.064 | −0.025 [−0.045, −0.005] | **0.009** |
+| v4 | +0.001 [−0.025, +0.028] | 0.938 | +0.019 [−0.001, +0.041] | 0.068 | −0.030 [−0.051, −0.010] | **0.006** |
+| v5 | −0.005 [−0.029, +0.019] | 0.671 | +0.016 [−0.006, +0.037] | 0.146 | −0.013 [−0.036, +0.008] | 0.221 |
+
+**This is the thesis's central quantitative result — state it exactly.**
+
+- v1 is significantly behind MAIRA-2 on detection F1 (p=0.017). After 150
+  oracle corrections (v3) **the difference is no longer significant** (+0.001,
+  p=0.997), and it stays that way at 300 and 308.
+- Say "*no longer significantly different*", never "matches" or "beats": a
+  non-significant difference is not evidence of equality. The CI (±0.027) is
+  the honest statement of how close.
+- IoU leans towards CURE from v3 on (p≈0.06) — worth one sentence, not a claim.
+- **Keyword naming remains significantly worse than MAIRA-2** for v1–v4; the
+  corrections fix *where* CURE draws boxes more than *what it calls them*.
+- Against the pre-registered target: the aggregate gap is not fully closed
+  (0.2321 vs 0.2379), but the paired per-image test — the stronger analysis —
+  finds no remaining difference. Report both; do not pick the kinder one.
+
 ### What the first real run cost — bugs the pilot caught
 
 A 20-image / 30-correction pilot was run before the full one. It paid for
