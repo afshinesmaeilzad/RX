@@ -217,6 +217,12 @@ needs the model.
 
 ## Where we are (2026-09-17) — the loop has been run end to end
 
+**For the whole project in one document — data, system, methods, every result,
+the decisions, the bugs, reproduction and the writing rules — read
+`../cxr_gui/thesis/PROJECT_DOSSIER.md`.** This file stays the working notes for
+the benchmark and the server.
+
+
 The GPU session is done. `cxr_gui/outputs/cl_oracle_run_2026-09-17/` holds the
 whole record: validation predictions, the 308 oracle corrections, the registry,
 every job log, and each version's gate verdict plus its 604-image predictions.
