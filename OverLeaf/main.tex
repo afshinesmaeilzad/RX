@@ -1,0 +1,70 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Master's thesis -- University of Rome Tor Vergata (tvthesis class)
+%%
+%% Main document: main.tex  (set it as "Main document" in Overleaf Settings
+%% if Overleaf picks example-master.tex instead).
+%%
+%% Compile: pdflatex main -> bibtex main -> pdflatex main -> pdflatex main
+%%          (Overleaf does this automatically)
+%%
+%% Status: Chapter 1 drafted (first version, for review); Chapters 2-5 and
+%% the appendices are the agreed outline -- titles only.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%  - master  : Master's thesis title page
+%%  - english : English labels and headings (Contents, Chapter, Abstract, ...)
+%%  - lof/lot : List of Figures / List of Tables after the Contents
+\documentclass[master,english,lof,lot]{tvthesis}
+
+% Official name of the organising structure, as listed in the class
+% documentation (alternatives there are Italian names).
+\courseorganizer{Macroarea di Ingegneria}
+\course{Mechatronics Engineering}
+\thesissubject{Artificial Intelligence and Computer Vision}
+
+\title{Correction-Driven Continual Learning for Grounded Chest X-ray Reporting}
+\subtitle{A Gated Update Loop for a Medical Vision--Language Model Evaluated on Held-Out PadChest-GR}
+\author{Afshin Esmaeilzad Ahandani}
+\IDnumber{0336000}
+
+\advisor{Prof.~Arianna Mencattini}
+% \coadvisor{Prof.~...}
+
+\AcademicYear{2025/2026}
+
+\begin{document}
+
+\maketitle
+
+\frontmatter
+
+% \dedication{To my family}
+
+\begin{acknowledgments}
+% TODO: acknowledgements (write last).
+\emph{To be written.}
+\end{acknowledgments}
+
+\begin{abstract}
+% TODO: abstract, 150--300 words (write last). Source:
+% cxr_gui/thesis/PROJECT_DOSSIER.md, Section 1.
+\emph{To be written.}
+\end{abstract}
+
+\tableofcontents
+
+\mainmatter
+
+\input{chapters/introduction}
+\input{chapters/background}
+\input{chapters/methods}
+\input{chapters/results}
+\input{chapters/conclusion}
+
+\appendix
+\input{chapters/appendix}
+
+\backmatter
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}

@@ -1,0 +1,184 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Example Master's thesis using tvthesis class
+%%
+%% Compile with:
+%%   pdflatex example-master
+%%   bibtex example-master
+%%   pdflatex example-master
+%%   pdflatex example-master
+%%
+%% Class Options Summary (refer to the docs for other options):
+%%  - english (default) / italian   : Selects thesis language for labels and headings
+%%  - fem                           : (Italian only) Use feminine label ("Candidata")
+%%  - lof                           : Automatically append List of Figures after TOC
+%%  - lot                           : Automatically append List of Tables after TOC
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\documentclass[master,italian,fem,lof,lot]{tvthesis}
+
+% One of the following are allowed:
+% Facoltà di Economia
+% Dipartimento di Giurisprudenza
+% Macroarea di Ingegneria
+% Macroarea di Lettere e Filosofia
+% Facoltà di Medicina e Chirurgia
+% Macroarea di Scienze Matematiche, Fisiche e Naturali
+\courseorganizer{Macroarea di Ingegneria}
+\course{Laurea Magistrale in Ingegneria Informatica}
+% The following is optional. Comment it out to remove from the title page.
+\thesissubject{Sistemi Distribuiti}
+
+\title{A Novel Approach to Distributed Computing}
+\subtitle{Algorithms, Protocols, and Performance Analysis}
+\author{Jane Doe}
+\IDnumber{0123456}
+
+\advisor{Prof.~Alice Smith}
+\advisor{Prof.~Joe Bloggs}
+\coadvisor{Prof.~Bob Johnson}
+\coadvisor{Prof.~John Q. Public}
+\coadvisor{Prof.~Robin Banks}
+
+\AcademicYear{2025/2026}
+
+\usepackage{lipsum}
+
+\begin{document}
+
+\maketitle
+
+\frontmatter
+
+\dedication{Alla mia famiglia}
+
+\tableofcontents
+
+
+
+\begin{acknowledgments}
+Vorrei esprimere la mia sincera gratitudine al mio relatore per la guida preziosa e il continuo supporto durante tutto questo lavoro. Sono inoltre grato al mio co-relatore per i commenti illuminanti e l’incoraggiamento.
+
+Un ringraziamento speciale alla mia famiglia e ai miei amici, il cui sostegno costante ha reso possibile questo percorso.
+\end{acknowledgments}
+
+
+\begin{abstract}
+Questa tesi presenta un approccio innovativo al calcolo distribuito.
+Proponiamo nuovi algoritmi e protocolli che migliorano le prestazioni
+e la scalabilità rispetto alle soluzioni all’avanguardia. Un’ampia valutazione
+sperimentale dimostra l’efficacia del nostro approccio in diversi scenari
+di riferimento. I risultati mostrano miglioramenti significativi nella
+capacità di elaborazione e nella latenza, mantenendo al contempo
+solide garanzie di coerenza.
+\end{abstract}
+
+
+\mainmatter
+
+\chapter{Introduzione}
+\label{ch:introduction}
+
+L'elaborazione distribuita è diventata un paradigma essenziale nell'ingegneria del software moderna. Con l'aumento della complessità e della scala dei sistemi, la necessità di algoritmi distribuiti efficienti diventa sempre più critica~\cite{tanenbaum2007}.
+
+I contributi principali di questa tesi sono:
+\begin{itemize}
+    \item Un nuovo algoritmo di consenso.
+    \item Un protocollo per la replicazione efficiente dei dati tra nodi distribuiti.
+    \item Una valutazione sperimentale estensiva delle soluzioni proposte.
+\end{itemize}
+
+Il resto di questa tesi è organizzato come segue. Il Capitolo~\ref{ch:background} fornisce le nozioni di base necessarie. Il Capitolo~\ref{ch:proposal} presenta il nostro approccio proposto. Il Capitolo~\ref{ch:conclusions} trae le conclusioni e delinea il lavoro futuro.
+
+
+\chapter{Concetti Fondamentali}
+\label{ch:background}
+
+In questo capitolo rivediamo i concetti fondamentali ed i lavori correlati che costituiscono la base della nostra ricerca.
+
+\section{Sistemi Distribuiti}
+
+Un sistema distribuito è un insieme di computer indipendenti che appare ai suoi utenti come un unico sistema coerente~\cite{tanenbaum2007}. Le principali sfide nella progettazione di tali sistemi includono:
+\begin{enumerate}
+    \item Raggiungere il consenso tra nodi distribuiti.
+    \item Garantire tolleranza ai guasti e disponibilità.
+    \item Mantenere la coerenza tra i dati replicati.
+\end{enumerate}
+
+\section{Algoritmi di Consenso}
+
+Gli algoritmi di consenso sono componenti fondamentali per i sistemi distribuiti. Gli algoritmi più noti includono Paxos~\cite{lamport1998} e Raft~\cite{ongaro2014}.
+
+\lipsum[1-2]
+
+
+\chapter{Approccio Proposto}
+\label{ch:proposal}
+
+In questo capitolo presentiamo il nostro approccio proposto al calcolo distribuito
+in ambienti eterogenei.
+
+\section{Modello di Sistema}
+
+Consideriamo un sistema distribuito composto da $n$ nodi interconnessi da
+una rete. Ogni nodo $i$ mantiene uno stato locale $s_i$ e comunica
+con gli altri nodi tramite passaggio di messaggi. Il sistema soddisfa le
+seguenti proprietà:
+%
+\begin{equation}
+\label{eq:consistency}
+\forall i, j \in \{1, \ldots, n\}: si = sj \text{ in quiete}
+\end{equation}
+
+L’architettura ad alto livello del nostro sistema è mostrata in
+Figura~\ref{fig:architecture}.
+
+\begin{figure}[t]
+    \centering
+    \caption{Architettura ad alto livello del sistema distribuito proposto.}
+    \label{fig:architecture}
+    \includegraphics[width=0.7\textwidth]{example-image}
+\end{figure}
+
+La Tabella~\ref{tab:comparison} riassume le principali proprietà degli algoritmi
+di consenso esistenti confrontate con il nostro approccio.
+
+\begin{table}[t]
+    \centering
+    \begin{tabular}{lccc}
+        \toprule
+        \textbf{Algoritmo} & \textbf{Tolleranza ai guasti} & \textbf{Latenza} & \textbf{Throughput} \\
+        \midrule
+        Paxos      & $f < n/2$ & Alta   & Media \\
+        Raft       & $f < n/2$ & Media  & Media \\
+        Nostro Metodo & $f < n/2$ & Bassa & Alta  \\
+        \bottomrule
+    \end{tabular}
+    \caption{Confronto tra algoritmi di consenso.}
+    \label{tab:comparison}
+\end{table}
+
+\section{Progettazione dell’Algoritmo}
+
+Il nostro algoritmo procede a turni. In ogni turno $r$, ogni nodo $i$:
+\begin{enumerate}
+    \item Trasmette in broadcast il proprio stato corrente $s_i^{(r)}$ a tutti gli altri nodi.
+    \item Raccoglie gli stati da una maggioranza di nodi.
+    \item Aggiorna il proprio stato in base alla funzione di fusione deterministica.
+\end{enumerate}
+
+\lipsum[3]
+
+\chapter{Conclusioni}
+\label{ch:conclusions}
+
+In questa tesi, abbiamo presentato un approccio innovativo al calcolo distribuito.
+I nostri risultati sperimentali dimostrano miglioramenti significativi rispetto alle soluzioni esistenti, sia in termini di throughput che di latenza.
+
+Il lavoro futuro si concentrerà sull’estensione del nostro approccio per supportare implementazioni geo-distribuite e sull’indagine dell’applicazione di tecniche di apprendimento automatico per la selezione adattiva dei protocolli.
+
+
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}

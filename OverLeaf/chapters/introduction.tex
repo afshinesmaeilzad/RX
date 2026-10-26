@@ -1,0 +1,162 @@
+%% =====================================================================
+%% Chapter 1 -- Introduction (first version, for review)
+%% Every number below comes from the stored runs; see
+%% cxr_gui/thesis/PROJECT_DOSSIER.md for its source.
+%% =====================================================================
+\chapter{Introduction}
+\label{ch:introduction}
+
+Automatic report generation for chest radiographs has moved, in a few years,
+from producing free text to producing \emph{grounded} reports: each finding is
+stated in words and, where it has a location, accompanied by a bounding box on
+the image. This thesis is about what happens after such a model is deployed.
+When a grounded model is wrong, its mistake is concrete --- a box in the wrong
+place, a finding that is not there, a finding that was missed, a finding with
+the wrong name --- and each of these mistakes can be corrected by a reviewer.
+The question studied here is whether those corrections can be turned into
+better versions of the model, and how a new version can be admitted only when
+it has been shown, on data it has never seen, not to be worse than the one it
+replaces.
+
+\section{Clinical and technical perspective}
+\label{sec:perspective}
+
+Chest radiography is among the most frequently performed imaging examinations,
+and writing its report is a recurring burden on radiology services.
+%% TODO(cite): a source for chest X-ray volume / reporting workload.
+Report-generation models aim to reduce that burden by drafting the report, but
+a free-text draft is hard to check: a reader cannot see which part of the image
+a sentence refers to, so an invented finding and a correct one look the same
+on the page.
+
+Grounded report generation addresses this by tying each finding to a region of
+the image. MAIRA-2~\cite{bannur2024maira2} established the task on a large
+scale, generating chest X-ray reports in which individual findings are
+localised. CURE~\cite{messina2026cure} follows the same idea with a much
+lighter footprint: it is a low-rank adapter (LoRA~\cite{hu2021lora}) trained on
+top of MedGemma~\cite{sellergren2025medgemma}, an openly available medical
+vision--language model, and it learns to localise and describe anatomical
+regions, including normal anatomy, in order to reduce hallucinated
+abnormalities. Both models were trained on PadChest-GR~\cite{castro2024padchestgr},
+the grounded, bilingual extension of the PadChest
+collection~\cite{bustos2020padchest}.
+
+From an engineering point of view the two models are very different objects.
+MAIRA-2 is a large model distributed as it is. CURE is a small set of adapter
+weights on an open base model, which means it can be trained further on a
+single workstation-class GPU, versioned, and replaced. That property is what
+makes a correction loop possible at all --- and it is also what makes it
+risky. A model that is updated repeatedly can lose what it previously knew, a
+phenomenon known as catastrophic forgetting~\cite{kirkpatrick2017forgetting},
+and an update that looks better on the cases it was trained on may be worse on
+everything else. Any loop that changes a model in use therefore needs a
+measured, repeatable test that every new version must pass before it may
+replace the current one.
+
+\section{Problem statement}
+\label{sec:problem}
+
+Two problems motivate this work.
+
+The first is \textbf{evaluation}. When a model is evaluated on data it was
+trained on, its scores measure memory rather than generalisation; leakage of
+this kind is a recurrent cause of overstated results in machine-learning-based
+research~\cite{kapoor2022leakage}. It is a concrete risk here: MAIRA-2 and CURE
+were both trained on PadChest-GR, so any comparison on that dataset is
+meaningful only if it respects the dataset's official split. The first
+benchmark built for this project did not: 129 of its 200 images belonged to the
+training split. On that sample CURE appeared clearly better than MAIRA-2;
+restricted to the held-out test images, the ranking reversed
+(Section~\ref{sec:leakage}). A published or internal advantage of one grounded
+model over another cannot be trusted until it has been measured on studies
+neither model has seen.
+
+The second is \textbf{improvement}. A reviewer who corrects a grounded report
+produces exactly the information a model would need to improve --- which boxes
+were right, which were misplaced, which were invented and which were missed.
+What is missing is a measured and repeatable route from those corrections to a
+model update that is safe to serve: one that turns corrections into training
+data in the model's own output format, protects what the model already knows,
+and decides on held-out data, with a statistical test, whether the new version
+may replace the old one.
+
+\section{Research objectives}
+\label{sec:objectives}
+
+The thesis addresses four research questions.
+
+\begin{enumerate}[label=\textbf{RQ\arabic*.}, leftmargin=*, itemsep=4pt]
+  \item On held-out PadChest-GR test studies, and with the official split
+        respected, how do CURE and MAIRA-2 compare on grounded detection
+        (F1 at IoU~$\ge$~0.5, intersection over union, hallucination rate) and on
+        the naming of findings (keyword F1)?
+  \item Can continued training of the CURE adapter on corrections, admitted
+        only through an adoption gate on the held-out test set, improve CURE ---
+        and does it change the comparison with MAIRA-2?
+  \item How does the effect depend on the number of corrections used for
+        training (50, 150 and 300)?
+  \item \emph{(Exploratory.)} When corrected findings are turned into a
+        narrative report by a general-purpose language model, does the text stay
+        within the findings it was given, as measured by an automated judge?
+        This question is examined as an automated consistency check only and is
+        not a clinical evaluation.
+\end{enumerate}
+
+To make the second and third questions answerable without depending on the
+availability of clinical reviewers, corrections are produced by an
+\emph{oracle reviewer} that derives them automatically from the ground truth of
+the PadChest-GR validation split (Section~\ref{sec:oracle}). The oracle sees
+every error and never makes one of its own, so it gives an upper bound on what
+corrections of this kind can achieve at a given volume.
+
+\section{Thesis contributions}
+\label{sec:contributions}
+
+The main contributions of this thesis are the following.
+
+\begin{enumerate}[label=(\arabic*), leftmargin=*, itemsep=4pt]
+  \item \textbf{A leakage-controlled benchmark of CURE and MAIRA-2.} Both
+        models are scored with a single scoring implementation on all 604
+        PadChest-GR test studies that carry ground-truth boxes. On held-out data
+        CURE is significantly behind MAIRA-2 in detection F1, the opposite of
+        what the leaked sample suggested (Section~\ref{sec:baseline}).
+  \item \textbf{A review application and server that capture corrections.} A
+        desktop application lets a reviewer move, relabel, add and delete boxes,
+        and exports every correction --- including deletions --- in a
+        training-ready format; a server runs the model, stores corrections and
+        manages adapter versions (Sections~\ref{sec:app} and~\ref{sec:server}).
+  \item \textbf{A gated continual-learning loop, run end to end.} New adapter
+        versions are trained from corrections mixed with replay examples from
+        the training split, and each version must pass an adoption gate on the
+        held-out test set, based on regression tolerances and a paired bootstrap
+        test, before it could be served (Sections~\ref{sec:training}
+        and~\ref{sec:gate}).
+  \item \textbf{A learning curve over the number of corrections.} Versions
+        trained on 50, 150 and 300 oracle corrections all pass the gate. The
+        consistent effect is higher precision and a lower hallucination rate;
+        after 150 corrections the per-image difference in detection F1 between
+        CURE and MAIRA-2 is no longer statistically significant
+        (Sections~\ref{sec:curve} and~\ref{sec:significance}).
+  \item \textbf{An exploratory check of the narrative report step.} Reports
+        written by a language model from the corrected findings are checked by a
+        second model for statements not supported by the input. The check is
+        automated and non-clinical, and is reported with its limits
+        (Section~\ref{sec:report-check}).
+\end{enumerate}
+
+\section{Thesis structure}
+\label{sec:structure}
+
+The rest of the thesis is organised as follows.
+Chapter~\ref{ch:background} introduces the background: how image models
+evolved into vision--language models, how such a model is built and how it is
+adapted from a base model, the grounded report-generation models compared
+here, the PadChest-GR dataset, and the evaluation methodology.
+Chapter~\ref{ch:methods} describes the materials and methods: the dataset and
+its splits, the review application, the server, the oracle reviewer, the
+continual-training procedure and the adoption gate.
+Chapter~\ref{ch:results} presents the experiments: the baseline comparison of
+CURE and MAIRA-2, the learning curve, the statistical analysis and the
+exploratory report check.
+Chapter~\ref{ch:conclusion} summarises the findings, discusses the limitations
+of the work and outlines future directions.
