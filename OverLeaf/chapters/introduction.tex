@@ -1,5 +1,5 @@
 %% =====================================================================
-%% Chapter 1 -- Introduction (first version, for review)
+%% Chapter 1 -- Introduction (complete first version, for review)
 %% Every number below comes from the stored runs; see
 %% cxr_gui/thesis/PROJECT_DOSSIER.md for its source.
 %% =====================================================================
@@ -21,18 +21,18 @@ replaces.
 \section{Clinical and technical perspective}
 \label{sec:perspective}
 
-Chest radiography is among the most frequently performed imaging examinations,
-and writing its report is a recurring burden on radiology services.
-%% TODO(cite): a source for chest X-ray volume / reporting workload.
-Report-generation models aim to reduce that burden by drafting the report, but
-a free-text draft is hard to check: a reader cannot see which part of the image
-a sentence refers to, so an invented finding and a correct one look the same
-on the page.
+Chest radiography is the most common imaging examination
+worldwide~\cite{irvin2019chexpert}, and the plain chest radiograph remains the
+most commonly ordered test for pulmonary disorders~\cite{raoof2012chest}. Every
+one of these examinations has to be read and reported. Report-generation models
+aim to help by drafting that report, but a free-text draft is hard to check: a
+reader cannot see which part of the image a sentence refers to, so an invented
+finding and a correct one look the same on the page.
 
 Grounded report generation addresses this by tying each finding to a region of
-the image. MAIRA-2~\cite{bannur2024maira2} established the task on a large
-scale, generating chest X-ray reports in which individual findings are
-localised. CURE~\cite{messina2026cure} follows the same idea with a much
+the image. MAIRA-2~\cite{bannur2024maira2} established this task, which its
+authors call \emph{grounded report generation}: a chest X-ray report in which
+individual findings are localised on the image. CURE~\cite{messina2026cure} follows the same idea with a much
 lighter footprint: it is a low-rank adapter (LoRA~\cite{hu2021lora}) trained on
 top of MedGemma~\cite{sellergren2025medgemma}, an openly available medical
 vision--language model, and it learns to localise and describe anatomical
@@ -109,6 +109,16 @@ the PadChest-GR validation split (Section~\ref{sec:oracle}). The oracle sees
 every error and never makes one of its own, so it gives an upper bound on what
 corrections of this kind can achieve at a given volume.
 
+The scope of the work follows from these questions. All experiments use a
+single dataset, PadChest-GR, and its official split: the validation split
+supplies the corrections, the training split supplies replay examples, and the
+test split is used only for evaluation. The thesis evaluates detection and
+naming of findings against the dataset's ground truth; it does not include a
+clinical evaluation of the generated reports, and the narrative-report check
+of RQ4 is an automated consistency check between model outputs. The reviewer
+application is built so that real corrections can enter the same pipeline, but
+every correction used in the experiments comes from the oracle.
+
 \section{Thesis contributions}
 \label{sec:contributions}
 
@@ -159,4 +169,7 @@ Chapter~\ref{ch:results} presents the experiments: the baseline comparison of
 CURE and MAIRA-2, the learning curve, the statistical analysis and the
 exploratory report check.
 Chapter~\ref{ch:conclusion} summarises the findings, discusses the limitations
-of the work and outlines future directions.
+of the work and outlines future directions. Appendix~\ref{app:provenance} maps
+every reported result to the stored output it comes from, and
+Appendix~\ref{app:reproduction} gives the software environment and the
+commands that reproduce the experiments.
